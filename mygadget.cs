@@ -693,7 +693,21 @@ internal sealed class GpuSensorManager : IDisposable
         lock (_lock) return _knownGpuIds.ToList();
     }
 
-    internal string NameFor(string id) => _gpuNames.TryGetValue(id, out var n) ? n : id.ToUpperInvariant();
+    private const int MaxGpuNameLength = 14; // Küçük/orta gösterge genişliğine sığacak üst sınır.
+
+    internal string NameFor(string id)
+    {
+        // NOT: _gpuNames, RefreshInstancesIfNeeded içinde arka plan (sensör) iş parçacığından
+        // _lock altında temizlenip yeniden dolduruluyor; burada da aynı kilitle okunmazsa,
+        // UI iş parçacığı tam o sırada boş/yarım bir sözlük görüp kalıcı olarak yanlış
+        // (ör. ham id) bir ada düşebilir.
+        lock (_lock)
+        {
+            if (_gpuNames.TryGetValue(id, out var n)) return n;
+            int idx = _knownGpuIds.IndexOf(id);
+            return idx >= 0 ? $"GPU {idx}" : "GPU";
+        }
+    }
 
     internal Dictionary<string, SensorReading> PollAll()
     {
@@ -819,7 +833,12 @@ internal sealed class GpuSensorManager : IDisposable
 
         for (int i = 0; i < _knownGpuIds.Count; i++)
         {
-            _gpuNames[_knownGpuIds[i]] = i < names.Count ? names[i] : $"GPU {i}";
+            string? wmiName = i < names.Count ? names[i] : null;
+            // Gerçek WMI adı varsa ve küçük gösterge etiketine sığacak kadar kısaysa onu
+            // kullan; yoksa (ya da çok uzunsa) "GPU 0", "GPU 1" gibi sığacak kısa bir ad yaz.
+            _gpuNames[_knownGpuIds[i]] = !string.IsNullOrWhiteSpace(wmiName) && wmiName.Length <= MaxGpuNameLength
+                ? wmiName
+                : $"GPU {i}";
         }
     }
 
