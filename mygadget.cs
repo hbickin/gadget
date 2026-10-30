@@ -953,7 +953,11 @@ internal sealed class TemperatureSensorManager : IDisposable
         if (readings == null && (_settings.TempSource == TemperatureSource.Auto || _settings.TempSource == TemperatureSource.Acpi))
             readings = TryAcpi(coreCount);
 
-        if (readings != null) return ApplyUnit(readings);
+        if (readings != null)
+        {
+            EnsurePackageFallback(readings);
+            return ApplyUnit(readings);
+        }
 
         _activeSourceDescription = "Yok (LibreHardwareMonitor'ü çalıştırın)";
         var fallback = new Dictionary<string, SensorReading>();
@@ -1084,6 +1088,25 @@ internal sealed class TemperatureSensorManager : IDisposable
             result.TryAdd($"cpu_core_{i}", SensorReading.Unavailable());
         result.TryAdd("cpu_package", SensorReading.Unavailable());
         return result;
+    }
+
+    private static void EnsurePackageFallback(Dictionary<string, SensorReading> readings)
+    {
+        // Donanım izleme aracı ayrı bir "Package/Tctl/Die" (genel çip) sensörü vermiyorsa
+        // (yalnızca çekirdek başına sıcaklık raporlanıyorsa), genel CPU sıcaklığını en sıcak
+        // çekirdeğin değerinden türetip Package göstergesinin her zaman anlamlı bir değer
+        // göstermesini sağlıyoruz.
+        if (readings.TryGetValue("cpu_package", out var existing) && existing.Available)
+            return;
+
+        var coreValues = readings
+            .Where(kv => kv.Key.StartsWith("cpu_core_", StringComparison.Ordinal) && kv.Value.Available)
+            .Select(kv => kv.Value.Value)
+            .ToList();
+        if (coreValues.Count == 0) return;
+
+        double synthetic = coreValues.Max();
+        readings["cpu_package"] = new SensorReading { Value = synthetic, Available = true, DigitalText = $"{synthetic:0.0}°" };
     }
 
     private Dictionary<string, SensorReading> ApplyUnit(Dictionary<string, SensorReading> readings)
