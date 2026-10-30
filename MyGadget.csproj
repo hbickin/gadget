@@ -10,7 +10,6 @@
     <AssemblyName>MyGadget</AssemblyName>
     <RootNamespace>MyGadget</RootNamespace>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
   </PropertyGroup>
 
   <ItemGroup>
