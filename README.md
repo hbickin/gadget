@@ -86,7 +86,8 @@ sekme bulunur:
   tek bir anahtarla açılıp kapatılır.
 - **Veri** — güncelleme aralığı, yumuşatma (hareketli ortalama) örnek
   sayısı, ibre sönüm katsayısı, tepe değer ibresi ve tutma süresi, sıcaklık
-  kaynağı/birimi, sanal/VPN adaptörlerini gizleme.
+  kaynağı/birimi, sanal/VPN adaptörlerini gizleme, gerçek ağ hızı testi
+  açık/kapalı ve aralığı (dk).
 - **Görünüm** — ölçek, boşluk, tema (Krom/Koyu spor/Açık/Retro), saydamlık,
   konum (Üst-orta/Üst-sol/Üst-sağ/Serbest) ve hedef monitör, dijital
   değer/etiket görünürlüğü, LED ayarları (açık/kapalı, yanıp sönme hızları,
@@ -116,9 +117,18 @@ penceresi açılır.
   bunu bozarsa uygulama çökmez, sessizce normal pencere moduna düşer.
 - GPU kullanım göstergeleri, Windows'un "GPU Engine" performans
   sayaçlarına dayanır (Windows 10 1803+ gereklidir).
-- Ağ hız yüzdesi, adaptörün bildirdiği bağlantı hızına (`NetworkInterface.Speed`)
-  göre hesaplanır; bu değer yanlış veya belirsizse Ayarlar → Göstergeler'den
-  ilgili adaptör için elle Mbps girilebilir.
+- Her ağ adaptörü için ayrı bir **İndirme (↓)** ve **Yükleme (↑)** göstergesi
+  vardır. Gösterge yüzdesi, adaptörün bildirdiği (çoğu zaman yanıltıcı)
+  bağlantı hızına değil, [speed.cloudflare.com](https://speed.cloudflare.com)
+  üzerinden periyodik olarak (varsayılan 20 dakikada bir) ölçülen gerçek
+  indirme/yükleme kapasitesine göre hesaplanır. Bu ölçüm tamamen arka planda
+  çalışır, uygulamanın açılışını/görünümünü etkilemez (ilk ölçüm açılıştan
+  ~20 saniye sonra başlar) ve isterseniz Ayarlar → Veri sekmesinden tamamen
+  kapatılabilir (bu durumda adaptörün bildirdiği bağlantı hızına geri
+  dönülür). Renk bölgeleri varsayılan olarak yeşil %0-50, sarı %50-85,
+  kırmızı %85-100'dür. Ölçülen/bildirilen hız yanlış veya belirsizse Ayarlar
+  → Göstergeler'den ilgili indirme/yükleme göstergesi için elle Mbps
+  girilebilir (manuel değer her zaman ölçümün önüne geçer).
 
 ## Dosyalar
 
