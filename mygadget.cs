@@ -1625,7 +1625,11 @@ internal sealed class GadgetForm : Form
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
         BackColor = Color.Black;
-        TransparencyKey = Color.Black; // UpdateLayeredWindow başarısız olursa yedek yöntem.
+        // NOT: TransparencyKeyburada KASITLI OLARAK ayarlanmıyor. WinForms, TransparencyKey
+        // ayarlandığında WS_EX_LAYERED'ı kendisi yönetip SetLayeredWindowAttributes (renk anahtarı)
+        // çağırır; bu, bizim UpdateLayeredWindow (piksel bazlı alfa) çağrılarımızla aynı HWND
+        // üzerinde çakışır ve pencereyi görünmez kılar. TransparencyKey yalnızca UpdateLayeredWindow
+        // gerçekten başarısız olursa, Present() içinde devreye alınır (bkz. EnableTransparencyKeyFallback).
 
         SyncStaticGauges();
         BuildGaugeModels();
@@ -2040,9 +2044,18 @@ internal sealed class GadgetForm : Form
             {
                 Logger.Log("Katmanlı pencere çizimi başarısız, TransparencyKey yöntemine düşülüyor: " + ex.Message);
                 _layeredOk = false;
+                EnableTransparencyKeyFallback();
             }
         }
         Invalidate();
+    }
+
+    private void EnableTransparencyKeyFallback()
+    {
+        // UpdateLayeredWindow çalışmadığında devreye alınan yedek yöntem: burada GERÇEKTEN
+        // SetLayeredWindowAttributes (renk anahtarı) kullanılacağı için artık içerik normal
+        // WM_PAINT üzerinden (bkz. OnPaint) çiziliyor olmalı.
+        TransparencyKey = Color.Black;
     }
 
     protected override void OnPaintBackground(PaintEventArgs e) { /* yanıp sönmeyi azalt */ }
