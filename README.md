@@ -63,8 +63,17 @@ sırasıyla şu kaynakları dener:
    yetkisi ister.
 
 **Sıcaklık göstergelerinin çalışması için LibreHardwareMonitor'ü indirip
-çalıştırmanız önerilir.** Hiçbir kaynak bulunamazsa göstergeler gri "N/A"
-gösterir; bu bir hata değildir.
+çalıştırmanız önerilir.** Hiçbir kaynak bulunamazsa göstergeler gösterilmez
+(N/A olan göstergeler şeritte yer kaplamaz); bu bir hata değildir.
+
+**"Package" (genel CPU) göstergesi hakkında:** Windows/donanım izleme
+araçları genellikle ayrı bir "genel CPU sıcaklığı" değeri vermez — yalnızca
+çekirdek başına sıcaklık ve (varsa) üretici bazlı bir paket/Tctl/Die sensörü
+raporlanır. Kullandığınız kaynak (LibreHardwareMonitor vb.) ayrı bir
+paket/Tctl/Die sensörü vermiyorsa, MyGadget "Package" göstergesinde o anki
+**en sıcak çekirdeğin** değerini otomatik olarak gösterir; böylece bu
+gösterge hangi donanımda olursanız olun her zaman anlamlı bir "genel CPU
+sıcaklığı" sunar.
 
 ## Ayarlar
 
