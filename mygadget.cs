@@ -198,7 +198,7 @@ internal static class NativeMethods
 
 public enum GaugeKind
 {
-    Cpu, Ram, CpuCoreTemp, CpuPackageTemp, ThreadUsage, DiskRead, Network, Gpu
+    Cpu, Ram, CpuCoreTemp, CpuPackageTemp, ThreadUsage, DiskRead, NetworkDown, NetworkUp, Gpu
 }
 
 public enum GaugeSize { Large, Medium, Small }
@@ -232,6 +232,8 @@ public sealed class AppSettings
     public int LhmHttpPort { get; set; } = 8085;
     public bool UseFahrenheit { get; set; } = false;
     public bool HideVirtualAdapters { get; set; } = true;
+    public bool NetworkSpeedTestEnabled { get; set; } = true;
+    public int NetworkSpeedTestIntervalMinutes { get; set; } = 20;
     public bool ShowThreadUsageMiniGauges { get; set; } = false;
 
     // Görünüm
@@ -560,7 +562,19 @@ internal sealed class NetworkSensorManager : IDisposable
         lock (_lock) return _adapters.Keys.ToList();
     }
 
-    internal Dictionary<string, SensorReading> PollAll(bool hideVirtual, Dictionary<string, double> manualMaxMbps)
+    internal const string DownSuffix = "_down";
+    internal const string UpSuffix = "_up";
+
+    /// <summary>
+    /// Her adaptör için ayrı indirme (↓) ve yükleme (↑) okuması üretir. Gösterge yüzdesi,
+    /// adaptörün bildirdiği (genelde yanıltıcı) bağlantı hızı yerine, periyodik gerçek hız
+    /// testinden (<paramref name="measuredDownMbps"/>/<paramref name="measuredUpMbps"/>) elde
+    /// edilen ölçülmüş kapasiteye göre hesaplanır; henüz ölçüm yoksa adaptör hızına, o da
+    /// alınamıyorsa 100 Mbps varsayımına düşülür. Kullanıcı ayarlardan elle bir üst sınır
+    /// girdiyse (ayrı ayrı indirme/yükleme için) o değer her şeyin önüne geçer.
+    /// </summary>
+    internal Dictionary<string, SensorReading> PollAll(bool hideVirtual, Dictionary<string, double> manualMaxMbps,
+        double? measuredDownMbps, double? measuredUpMbps)
     {
         RefreshIfNeeded(hideVirtual);
         var result = new Dictionary<string, SensorReading>();
@@ -571,6 +585,8 @@ internal sealed class NetworkSensorManager : IDisposable
             foreach (var kv in _adapters)
             {
                 var info = kv.Value;
+                string downId = info.Id + DownSuffix;
+                string upId = info.Id + UpSuffix;
                 try
                 {
                     var stats = info.Nic.GetIPv4Statistics();
@@ -585,25 +601,33 @@ internal sealed class NetworkSensorManager : IDisposable
                     info.LastSampleUtc = now;
                     info.HasSample = true;
 
-                    double speedMbps = manualMaxMbps.TryGetValue(info.Id, out var manual) && manual > 0
-                        ? manual
-                        : info.Nic.Speed > 0 ? info.Nic.Speed / 1_000_000.0 : 100.0;
+                    double linkFallbackMbps = info.Nic.Speed > 0 ? info.Nic.Speed / 1_000_000.0 : 100.0;
+                    double downCapMbps = manualMaxMbps.TryGetValue(downId, out var manualDown) && manualDown > 0
+                        ? manualDown : measuredDownMbps ?? linkFallbackMbps;
+                    double upCapMbps = manualMaxMbps.TryGetValue(upId, out var manualUp) && manualUp > 0
+                        ? manualUp : measuredUpMbps ?? linkFallbackMbps;
 
                     double downMbps = downBytesPerSec * 8 / 1_000_000.0;
                     double upMbps = upBytesPerSec * 8 / 1_000_000.0;
-                    double pct = Math.Clamp(Math.Max(downMbps, upMbps) / speedMbps * 100.0, 0, 100);
 
-                    result[info.Id] = new SensorReading
+                    result[downId] = new SensorReading
                     {
-                        Value = pct,
+                        Value = Math.Clamp(downMbps / Math.Max(0.1, downCapMbps) * 100.0, 0, 100),
                         Available = true,
-                        DigitalText = $"↓{FormatRate(downBytesPerSec)} ↑{FormatRate(upBytesPerSec)}"
+                        DigitalText = FormatRate(downBytesPerSec)
+                    };
+                    result[upId] = new SensorReading
+                    {
+                        Value = Math.Clamp(upMbps / Math.Max(0.1, upCapMbps) * 100.0, 0, 100),
+                        Available = true,
+                        DigitalText = FormatRate(upBytesPerSec)
                     };
                 }
                 catch (Exception ex)
                 {
                     Logger.Log($"Ağ adaptörü okunamadı ({info.Id}): " + ex.Message);
-                    result[info.Id] = SensorReading.Unavailable();
+                    result[downId] = SensorReading.Unavailable();
+                    result[upId] = SensorReading.Unavailable();
                 }
             }
         }
@@ -613,7 +637,7 @@ internal sealed class NetworkSensorManager : IDisposable
     private static string FormatRate(double bytesPerSec)
     {
         double mbPerSec = bytesPerSec / 1024.0 / 1024.0;
-        return mbPerSec >= 1 ? $"{mbPerSec:0.0}MB/s" : $"{bytesPerSec / 1024.0:0}KB/s";
+        return mbPerSec >= 1 ? $"{mbPerSec:0.0} MB/s" : $"{bytesPerSec / 1024.0:0} KB/s";
     }
 
     private void RefreshIfNeeded(bool hideVirtual)
@@ -666,6 +690,127 @@ internal sealed class NetworkSensorManager : IDisposable
     public void Dispose()
     {
         NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
+    }
+}
+
+/// <summary>
+/// Periyodik olarak gerçek indirme/yükleme hızını ölçer (speedtest benzeri), böylece ağ
+/// göstergelerinin yüzdesi adaptörün (çoğu zaman yanıltıcı) bildirdiği bağlantı hızına değil,
+/// gerçek ölçülmüş kapasiteye göre hesaplanabilir. Ölçüm tamamen arka planda, uygulamanın
+/// açılışından bir süre sonra başlar ve hiçbir zaman UI veya sensör döngüsünü bloklamaz.
+/// </summary>
+internal sealed class NetworkSpeedTester : IDisposable
+{
+    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(60) };
+    private System.Threading.Timer? _timer;
+    private AppSettings _settings;
+    private volatile bool _running;
+
+    private const int DownloadTestBytes = 10_000_000; // ~10 MB
+    private const int UploadTestBytes = 5_000_000;    // ~5 MB
+    private const int InitialDelaySeconds = 20;        // açılışı/ilk görüntüyü etkilememesi için gecikmeli başlar.
+
+    internal double? LastDownloadMbps { get; private set; }
+    internal double? LastUploadMbps { get; private set; }
+
+    internal NetworkSpeedTester(AppSettings settings) => _settings = settings;
+
+    internal void Start() => Reschedule(InitialDelaySeconds * 1000);
+
+    internal void UpdateSettings(AppSettings settings)
+    {
+        bool changed = _settings.NetworkSpeedTestEnabled != settings.NetworkSpeedTestEnabled
+            || _settings.NetworkSpeedTestIntervalMinutes != settings.NetworkSpeedTestIntervalMinutes;
+        _settings = settings;
+        if (changed) Reschedule(InitialDelaySeconds * 1000);
+    }
+
+    private void Reschedule(int firstDueMs)
+    {
+        _timer?.Dispose();
+        _timer = null;
+        if (!_settings.NetworkSpeedTestEnabled) return;
+
+        int intervalMs = Math.Max(1, _settings.NetworkSpeedTestIntervalMinutes) * 60_000;
+        _timer = new System.Threading.Timer(_ => _ = RunTestAsync(), null, firstDueMs, intervalMs);
+    }
+
+    private async Task RunTestAsync()
+    {
+        if (_running || !_settings.NetworkSpeedTestEnabled) return;
+        _running = true;
+        try
+        {
+            double? down = await MeasureDownloadAsync().ConfigureAwait(false);
+            double? up = await MeasureUploadAsync().ConfigureAwait(false);
+            if (down.HasValue) LastDownloadMbps = down;
+            if (up.HasValue) LastUploadMbps = up;
+            if (down.HasValue || up.HasValue)
+                Logger.Log($"Ağ hız testi tamamlandı: indirme={down:0.0} Mbps, yükleme={up:0.0} Mbps");
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Ağ hız testi başarısız: " + ex.Message);
+        }
+        finally
+        {
+            _running = false;
+        }
+    }
+
+    private async Task<double?> MeasureDownloadAsync()
+    {
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            using var response = await _http.GetAsync(
+                $"https://speed.cloudflare.com/__down?bytes={DownloadTestBytes}",
+                HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            using var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+            var buffer = new byte[81920];
+            long total = 0;
+            int read;
+            while ((read = await stream.ReadAsync(buffer).ConfigureAwait(false)) > 0)
+                total += read;
+            sw.Stop();
+
+            if (sw.Elapsed.TotalSeconds < 0.05 || total == 0) return null;
+            return total * 8.0 / 1_000_000.0 / sw.Elapsed.TotalSeconds;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("İndirme hız testi başarısız: " + ex.Message);
+            return null;
+        }
+    }
+
+    private async Task<double?> MeasureUploadAsync()
+    {
+        try
+        {
+            var data = new byte[UploadTestBytes];
+            using var content = new ByteArrayContent(data);
+            var sw = Stopwatch.StartNew();
+            using var response = await _http.PostAsync("https://speed.cloudflare.com/__up", content).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            sw.Stop();
+
+            if (sw.Elapsed.TotalSeconds < 0.05) return null;
+            return data.Length * 8.0 / 1_000_000.0 / sw.Elapsed.TotalSeconds;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Yükleme hız testi başarısız: " + ex.Message);
+            return null;
+        }
+    }
+
+    public void Dispose()
+    {
+        _timer?.Dispose();
+        _http.Dispose();
     }
 }
 
@@ -1533,6 +1678,7 @@ internal sealed class SensorHub : IDisposable
     private readonly RamSensor _ram = new();
     private readonly DiskSensor _disk = new();
     private readonly NetworkSensorManager _network = new();
+    private readonly NetworkSpeedTester _speedTester;
     private readonly GpuSensorManager _gpu = new();
     private readonly ThreadUsageSensorManager _threads = new();
     private readonly TemperatureSensorManager _temp;
@@ -1552,6 +1698,7 @@ internal sealed class SensorHub : IDisposable
     {
         _settings = settings;
         _temp = new TemperatureSensorManager(settings);
+        _speedTester = new NetworkSpeedTester(settings);
         _coreCount = CpuTopology.GetPhysicalCoreCount();
         _network.DiscoveryChanged += () => StructureChanged?.Invoke();
         _gpu.DiscoveryChanged += () => StructureChanged?.Invoke();
@@ -1566,12 +1713,14 @@ internal sealed class SensorHub : IDisposable
     {
         _settings = settings;
         _temp.UpdateSettings(settings);
+        _speedTester.UpdateSettings(settings);
         Reschedule();
     }
 
     internal void Start()
     {
         _threads.EnsureInitialized();
+        _speedTester.Start();
         Reschedule();
     }
 
@@ -1595,7 +1744,8 @@ internal sealed class SensorHub : IDisposable
                 ["disk_c"] = _disk.Read(),
             };
 
-            foreach (var kv in _network.PollAll(_settings.HideVirtualAdapters, BuildManualSpeedMap()))
+            foreach (var kv in _network.PollAll(_settings.HideVirtualAdapters, BuildManualSpeedMap(),
+                _speedTester.LastDownloadMbps, _speedTester.LastUploadMbps))
                 snapshot[kv.Key] = kv.Value;
 
             foreach (var kv in _gpu.PollAll())
@@ -1627,7 +1777,7 @@ internal sealed class SensorHub : IDisposable
     }
 
     private Dictionary<string, double> BuildManualSpeedMap() =>
-        _settings.Gauges.Where(g => g.Kind == GaugeKind.Network && g.ManualMaxMbps > 0)
+        _settings.Gauges.Where(g => (g.Kind == GaugeKind.NetworkDown || g.Kind == GaugeKind.NetworkUp) && g.ManualMaxMbps > 0)
             .ToDictionary(g => g.Id, g => g.ManualMaxMbps);
 
     internal SensorReading? TryGet(string id)
@@ -1644,6 +1794,7 @@ internal sealed class SensorHub : IDisposable
         _cpu.Dispose();
         _disk.Dispose();
         _network.Dispose();
+        _speedTester.Dispose();
         _gpu.Dispose();
         _threads.Dispose();
         _temp.Dispose();
@@ -1891,7 +2042,10 @@ internal sealed class GadgetForm : Form
     private void SyncDiscoveredGauges()
     {
         bool changed = false;
-        changed |= SyncDynamicKind(GaugeKind.Network, _hub.NetworkAdapterIds(), 80, 95);
+        var netIds = _hub.NetworkAdapterIds();
+        // Yeşil %50 / sarı %35 / kırmızı %15 olacak şekilde eşikler 50 ve 85.
+        changed |= SyncDynamicKind(GaugeKind.NetworkDown, netIds.Select(id => id + NetworkSensorManager.DownSuffix).ToList(), 50, 85);
+        changed |= SyncDynamicKind(GaugeKind.NetworkUp, netIds.Select(id => id + NetworkSensorManager.UpSuffix).ToList(), 50, 85);
         changed |= SyncDynamicKind(GaugeKind.Gpu, _hub.GpuIds(), 80, 95);
 
         if (!changed) return;
@@ -1944,11 +2098,15 @@ internal sealed class GadgetForm : Form
         GaugeKind.DiskRead => "C:",
         GaugeKind.CpuPackageTemp => "Package",
         GaugeKind.CpuCoreTemp => "Core " + ExtractTrailingNumber(gs.Id),
-        GaugeKind.Network => gs.Id,
+        GaugeKind.NetworkDown => StripSuffix(gs.Id, NetworkSensorManager.DownSuffix) + " ↓",
+        GaugeKind.NetworkUp => StripSuffix(gs.Id, NetworkSensorManager.UpSuffix) + " ↑",
         GaugeKind.Gpu => _hub.GpuDisplayName(gs.Id),
         GaugeKind.ThreadUsage => "T" + ExtractTrailingNumber(gs.Id),
         _ => gs.Id
     };
+
+    private static string StripSuffix(string id, string suffix) =>
+        id.EndsWith(suffix, StringComparison.Ordinal) ? id[..^suffix.Length] : id;
 
     private static string ExtractTrailingNumber(string id)
     {
@@ -2299,6 +2457,8 @@ internal sealed class SettingsForm : Form
     private ComboBox _tempUnitInput = null!;
     private CheckBox _hideVirtualInput = null!;
     private CheckBox _threadMiniInput = null!;
+    private CheckBox _speedTestEnabledInput = null!;
+    private NumericUpDown _speedTestIntervalInput = null!;
 
     // Görünüm
     private NumericUpDown _scaleInput = null!;
@@ -2485,6 +2645,12 @@ internal sealed class SettingsForm : Form
         _threadMiniInput = new CheckBox { Checked = _working.ShowThreadUsageMiniGauges, Text = "Göster", AutoSize = true };
         AddRow(layout, "İş parçacığı kullanım mini göstergeleri:", _threadMiniInput);
 
+        _speedTestEnabledInput = new CheckBox { Checked = _working.NetworkSpeedTestEnabled, Text = "Etkin (speed.cloudflare.com)", AutoSize = true };
+        AddRow(layout, "Gerçek ağ hızı testi:", _speedTestEnabledInput);
+
+        _speedTestIntervalInput = new NumericUpDown { Minimum = 5, Maximum = 180, Value = _working.NetworkSpeedTestIntervalMinutes };
+        AddRow(layout, "Hız testi aralığı (dk):", _speedTestIntervalInput);
+
         page.Controls.Add(layout);
         return page;
     }
@@ -2618,6 +2784,8 @@ internal sealed class SettingsForm : Form
         _working.UseFahrenheit = _tempUnitInput.SelectedIndex == 1;
         _working.HideVirtualAdapters = _hideVirtualInput.Checked;
         _working.ShowThreadUsageMiniGauges = _threadMiniInput.Checked;
+        _working.NetworkSpeedTestEnabled = _speedTestEnabledInput.Checked;
+        _working.NetworkSpeedTestIntervalMinutes = (int)_speedTestIntervalInput.Value;
 
         _working.ScalePercent = (int)_scaleInput.Value;
         _working.GaugeSpacing = (int)_spacingInput.Value;
@@ -2692,12 +2860,20 @@ internal sealed class SettingsForm : Form
             {
                 GaugeKind.Gpu => 80,
                 GaugeKind.Ram => 80,
+                GaugeKind.NetworkDown or GaugeKind.NetworkUp => 50,
                 _ => 70
             };
-            row.Settings.RedThreshold = row.Settings.Kind == GaugeKind.Gpu ? 95 : 90;
+            row.Settings.RedThreshold = row.Settings.Kind switch
+            {
+                GaugeKind.Gpu => 95,
+                GaugeKind.NetworkDown or GaugeKind.NetworkUp => 85,
+                _ => 90
+            };
             row.Settings.Visible = true;
             row.Settings.ManualMaxMbps = 0;
         }
+        _speedTestEnabledInput.Checked = d.NetworkSpeedTestEnabled;
+        _speedTestIntervalInput.Value = d.NetworkSpeedTestIntervalMinutes;
         RefreshGaugeGrid();
     }
 
