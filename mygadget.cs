@@ -267,7 +267,7 @@ public sealed class AppSettings
         var s = new AppSettings();
         int order = 0;
         s.Gauges.Add(new GaugeSettings { Id = "cpu", Kind = GaugeKind.Cpu, Order = order++, YellowThreshold = 70, RedThreshold = 90 });
-        s.Gauges.Add(new GaugeSettings { Id = "ram", Kind = GaugeKind.Ram, Order = order++, YellowThreshold = 75, RedThreshold = 90 });
+        s.Gauges.Add(new GaugeSettings { Id = "ram", Kind = GaugeKind.Ram, Order = order++, YellowThreshold = 80, RedThreshold = 90 });
         return s;
     }
 }
@@ -2688,7 +2688,12 @@ internal sealed class SettingsForm : Form
 
         foreach (var row in _gaugeRows)
         {
-            row.Settings.YellowThreshold = row.Settings.Kind == GaugeKind.Gpu ? 80 : 70;
+            row.Settings.YellowThreshold = row.Settings.Kind switch
+            {
+                GaugeKind.Gpu => 80,
+                GaugeKind.Ram => 80,
+                _ => 70
+            };
             row.Settings.RedThreshold = row.Settings.Kind == GaugeKind.Gpu ? 95 : 90;
             row.Settings.Visible = true;
             row.Settings.ManualMaxMbps = 0;
