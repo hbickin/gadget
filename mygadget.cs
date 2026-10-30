@@ -1677,8 +1677,11 @@ internal sealed class GadgetForm : Form
         {
             var cp = base.CreateParams;
             cp.ExStyle |= NativeMethods.WS_EX_LAYERED | NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_NOACTIVATE;
-            if (_settings.ClickThrough) cp.ExStyle |= NativeMethods.WS_EX_TRANSPARENT;
-            if (_settings.AlwaysOnTop) cp.ExStyle |= NativeMethods.WS_EX_TOPMOST;
+            // NOT: Control'ün temel kurucusu, GadgetForm'un kendi kurucu gövdesi (ve _settings alan
+            // ataması) çalışmadan ÖNCE bu getter'ı çağırır (sanal üye çağrısı taban kurucudan gelir).
+            // Bu yüzden _settings burada null olabilir; null-koşullu erişimle çökmeyi önlüyoruz.
+            if (_settings?.ClickThrough == true) cp.ExStyle |= NativeMethods.WS_EX_TRANSPARENT;
+            if (_settings?.AlwaysOnTop ?? true) cp.ExStyle |= NativeMethods.WS_EX_TOPMOST;
             return cp;
         }
     }
