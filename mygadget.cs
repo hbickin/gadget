@@ -5,10 +5,14 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
+using System.Management;
+using System.Net.Http;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 namespace MyGadget;
@@ -409,6 +413,609 @@ internal sealed class RamSensor
     }
 }
 
+[SupportedOSPlatform("windows")]
+internal sealed class DiskSensor : IDisposable
+{
+    private readonly string _instance;
+    private PerformanceCounter? _readTimeCounter;
+    private PerformanceCounter? _readBytesCounter;
+    private bool _warned;
+
+    internal DiskSensor(string instance = "C:")
+    {
+        _instance = instance;
+        try
+        {
+            if (PerformanceCounterCategory.Exists("LogicalDisk"))
+            {
+                _readTimeCounter = new PerformanceCounter("LogicalDisk", "% Disk Read Time", instance, true);
+                _readBytesCounter = new PerformanceCounter("LogicalDisk", "Disk Read Bytes/sec", instance, true);
+                _readTimeCounter.NextValue();
+                _readBytesCounter.NextValue();
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log($"Disk sayacı başlatılamadı ({instance}): " + ex.Message);
+            _readTimeCounter = null;
+            _readBytesCounter = null;
+        }
+    }
+
+    internal SensorReading Read()
+    {
+        if (_readTimeCounter == null || _readBytesCounter == null) return SensorReading.Unavailable();
+        try
+        {
+            double pct = Math.Clamp(_readTimeCounter.NextValue(), 0, 100);
+            double mbPerSec = _readBytesCounter.NextValue() / 1024.0 / 1024.0;
+            return new SensorReading { Value = pct, Available = true, DigitalText = $"{mbPerSec:0.0} MB/s" };
+        }
+        catch (Exception ex)
+        {
+            if (!_warned) { Logger.Log("Disk okuma hatası: " + ex.Message); _warned = true; }
+            return SensorReading.Unavailable();
+        }
+    }
+
+    public void Dispose()
+    {
+        _readTimeCounter?.Dispose();
+        _readBytesCounter?.Dispose();
+    }
+}
+
+internal sealed class NetworkAdapterInfo
+{
+    public required string Id;          // Görünen ad (ayar anahtarı olarak da kullanılır)
+    public required NetworkInterface Nic;
+    public long LastBytesReceived;
+    public long LastBytesSent;
+    public DateTime LastSampleUtc;
+}
+
+internal sealed class NetworkSensorManager : IDisposable
+{
+    private readonly Dictionary<string, NetworkAdapterInfo> _adapters = new();
+    private readonly object _lock = new();
+    private volatile bool _dirty = true;
+
+    internal event Action? DiscoveryChanged;
+
+    internal NetworkSensorManager()
+    {
+        NetworkChange.NetworkAddressChanged += OnNetworkChanged;
+    }
+
+    private void OnNetworkChanged(object? sender, EventArgs e) => _dirty = true;
+
+    internal List<string> CurrentIds()
+    {
+        lock (_lock) return _adapters.Keys.ToList();
+    }
+
+    internal Dictionary<string, SensorReading> PollAll(bool hideVirtual, Dictionary<string, double> manualMaxMbps)
+    {
+        RefreshIfNeeded(hideVirtual);
+        var result = new Dictionary<string, SensorReading>();
+        var now = DateTime.UtcNow;
+
+        lock (_lock)
+        {
+            foreach (var kv in _adapters)
+            {
+                var info = kv.Value;
+                try
+                {
+                    var stats = info.Nic.GetIPv4Statistics();
+                    double elapsed = (now - info.LastSampleUtc).TotalSeconds;
+                    if (elapsed <= 0) elapsed = 1;
+
+                    long rx = stats.BytesReceived, tx = stats.BytesSent;
+                    double downBytesPerSec = info.LastBytesReceived > 0 ? Math.Max(0, rx - info.LastBytesReceived) / elapsed : 0;
+                    double upBytesPerSec = info.LastBytesSent > 0 ? Math.Max(0, tx - info.LastBytesSent) / elapsed : 0;
+                    info.LastBytesReceived = rx;
+                    info.LastBytesSent = tx;
+                    info.LastSampleUtc = now;
+
+                    double speedMbps = manualMaxMbps.TryGetValue(info.Id, out var manual) && manual > 0
+                        ? manual
+                        : info.Nic.Speed > 0 ? info.Nic.Speed / 1_000_000.0 : 100.0;
+
+                    double downMbps = downBytesPerSec * 8 / 1_000_000.0;
+                    double upMbps = upBytesPerSec * 8 / 1_000_000.0;
+                    double pct = Math.Clamp(Math.Max(downMbps, upMbps) / speedMbps * 100.0, 0, 100);
+
+                    result[info.Id] = new SensorReading
+                    {
+                        Value = pct,
+                        Available = true,
+                        DigitalText = $"↓{FormatRate(downBytesPerSec)} ↑{FormatRate(upBytesPerSec)}"
+                    };
+                }
+                catch (Exception ex)
+                {
+                    Logger.Log($"Ağ adaptörü okunamadı ({info.Id}): " + ex.Message);
+                    result[info.Id] = SensorReading.Unavailable();
+                }
+            }
+        }
+        return result;
+    }
+
+    private static string FormatRate(double bytesPerSec)
+    {
+        double mbPerSec = bytesPerSec / 1024.0 / 1024.0;
+        return mbPerSec >= 1 ? $"{mbPerSec:0.0}MB/s" : $"{bytesPerSec / 1024.0:0}KB/s";
+    }
+
+    private void RefreshIfNeeded(bool hideVirtual)
+    {
+        if (!_dirty) return;
+        _dirty = false;
+        try
+        {
+            var current = NetworkInterface.GetAllNetworkInterfaces()
+                .Where(n => n.OperationalStatus == OperationalStatus.Up)
+                .Where(n => n.NetworkInterfaceType is NetworkInterfaceType.Ethernet or NetworkInterfaceType.Ethernet3Megabit
+                    or NetworkInterfaceType.GigabitEthernet or NetworkInterfaceType.FastEthernetT
+                    or NetworkInterfaceType.Wireless80211)
+                .Where(n => !hideVirtual || !LooksVirtual(n))
+                .ToList();
+
+            lock (_lock)
+            {
+                var currentIds = current.Select(n => n.Name).ToHashSet();
+                foreach (var staleId in _adapters.Keys.Where(id => !currentIds.Contains(id)).ToList())
+                    _adapters.Remove(staleId);
+
+                foreach (var nic in current)
+                {
+                    if (!_adapters.ContainsKey(nic.Name))
+                    {
+                        _adapters[nic.Name] = new NetworkAdapterInfo { Id = nic.Name, Nic = nic, LastSampleUtc = DateTime.UtcNow };
+                    }
+                    else
+                    {
+                        _adapters[nic.Name].Nic = nic; // handle nesnesi güncellensin
+                    }
+                }
+            }
+            DiscoveryChanged?.Invoke();
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Ağ adaptörleri listelenemedi: " + ex.Message);
+        }
+    }
+
+    private static bool LooksVirtual(NetworkInterface nic)
+    {
+        string d = (nic.Description + " " + nic.Name).ToLowerInvariant();
+        return d.Contains("virtual") || d.Contains("vpn") || d.Contains("hyper-v") || d.Contains("vmware")
+            || d.Contains("virtualbox") || d.Contains("tap-") || d.Contains("loopback") || d.Contains("tunnel");
+    }
+
+    public void Dispose()
+    {
+        NetworkChange.NetworkAddressChanged -= OnNetworkChanged;
+    }
+}
+
+internal sealed class GpuEngineGroup
+{
+    public required string Id;
+    public readonly Dictionary<string, double> EngineTypeTotals = new();
+}
+
+internal sealed class GpuSensorManager : IDisposable
+{
+    private readonly Dictionary<string, PerformanceCounter> _counters = new();
+    private readonly object _lock = new();
+    private List<string> _knownGpuIds = new();
+    private DateTime _lastRefresh = DateTime.MinValue;
+    private static readonly Regex InstanceRegex = new(
+        @"luid_0x([0-9A-Fa-f]+)_0x([0-9A-Fa-f]+).*?engtype_(\w+)$", RegexOptions.Compiled);
+
+    internal event Action? DiscoveryChanged;
+    internal bool CategoryAvailable { get; private set; } = true;
+    private readonly Dictionary<string, string> _gpuNames = new();
+
+    internal List<string> CurrentIds()
+    {
+        lock (_lock) return _knownGpuIds.ToList();
+    }
+
+    internal string NameFor(string id) => _gpuNames.TryGetValue(id, out var n) ? n : id.ToUpperInvariant();
+
+    internal Dictionary<string, SensorReading> PollAll()
+    {
+        RefreshInstancesIfNeeded();
+        if (!CategoryAvailable) return new();
+
+        var groups = new Dictionary<string, GpuEngineGroup>();
+        lock (_lock)
+        {
+            foreach (var kv in _counters)
+            {
+                var match = InstanceRegex.Match(kv.Key);
+                if (!match.Success) continue;
+                string gpuId = "gpu_" + match.Groups[1].Value + "_" + match.Groups[2].Value;
+                string engineType = match.Groups[3].Value;
+
+                double value;
+                try { value = kv.Value.NextValue(); }
+                catch { continue; }
+
+                if (!groups.TryGetValue(gpuId, out var grp))
+                {
+                    grp = new GpuEngineGroup { Id = gpuId };
+                    groups[gpuId] = grp;
+                }
+                grp.EngineTypeTotals.TryGetValue(engineType, out var existing);
+                grp.EngineTypeTotals[engineType] = existing + value;
+            }
+        }
+
+        var result = new Dictionary<string, SensorReading>();
+        foreach (var grp in groups.Values)
+        {
+            double maxEngine = grp.EngineTypeTotals.Count > 0 ? grp.EngineTypeTotals.Values.Max() : 0;
+            double pct = Math.Clamp(maxEngine, 0, 100);
+            result[grp.Id] = new SensorReading { Value = pct, Available = true, DigitalText = $"{pct:0}%" };
+        }
+        return result;
+    }
+
+    private void RefreshInstancesIfNeeded()
+    {
+        if ((DateTime.UtcNow - _lastRefresh).TotalSeconds < 5) return;
+        _lastRefresh = DateTime.UtcNow;
+
+        try
+        {
+            if (!PerformanceCounterCategory.Exists("GPU Engine"))
+            {
+                CategoryAvailable = false;
+                return;
+            }
+            CategoryAvailable = true;
+
+            var category = new PerformanceCounterCategory("GPU Engine");
+            var instanceNames = category.GetInstanceNames()
+                .Where(n => n.Contains("engtype_", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            lock (_lock)
+            {
+                var toRemove = _counters.Keys.Except(instanceNames).ToList();
+                foreach (var name in toRemove)
+                {
+                    _counters[name].Dispose();
+                    _counters.Remove(name);
+                }
+
+                foreach (var name in instanceNames)
+                {
+                    if (_counters.ContainsKey(name)) continue;
+                    try
+                    {
+                        var counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", name, true);
+                        counter.NextValue();
+                        _counters[name] = counter;
+                    }
+                    catch
+                    {
+                        // Bazı örnekler anlık olarak kaybolabilir; görmezden gel.
+                    }
+                }
+
+                var newGpuIds = _counters.Keys
+                    .Select(n => InstanceRegex.Match(n))
+                    .Where(m => m.Success)
+                    .Select(m => "gpu_" + m.Groups[1].Value + "_" + m.Groups[2].Value)
+                    .Distinct()
+                    .OrderBy(x => x)
+                    .ToList();
+
+                if (!newGpuIds.SequenceEqual(_knownGpuIds))
+                {
+                    _knownGpuIds = newGpuIds;
+                    AssignGpuNames();
+                    DiscoveryChanged?.Invoke();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("GPU Engine sayaçları listelenemedi: " + ex.Message);
+            CategoryAvailable = false;
+        }
+    }
+
+    private void AssignGpuNames()
+    {
+        _gpuNames.Clear();
+        var names = new List<string>();
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT Name FROM Win32_VideoController");
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                if (mo["Name"] is string s) names.Add(s);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Win32_VideoController okunamadı: " + ex.Message);
+        }
+
+        for (int i = 0; i < _knownGpuIds.Count; i++)
+        {
+            _gpuNames[_knownGpuIds[i]] = i < names.Count ? names[i] : $"GPU {i}";
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_lock)
+        {
+            foreach (var c in _counters.Values) c.Dispose();
+            _counters.Clear();
+        }
+    }
+}
+
+internal static class CpuTopology
+{
+    internal static int GetPhysicalCoreCount()
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT NumberOfCores FROM Win32_Processor");
+            int total = 0;
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                if (mo["NumberOfCores"] != null)
+                    total += Convert.ToInt32(mo["NumberOfCores"]);
+            }
+            if (total > 0) return total;
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Çekirdek sayısı WMI üzerinden okunamadı: " + ex.Message);
+        }
+        return Math.Max(1, Environment.ProcessorCount / 2);
+    }
+}
+
+internal sealed class ThreadUsageSensorManager : IDisposable
+{
+    private readonly Dictionary<string, PerformanceCounter> _counters = new();
+    private bool _initialized;
+
+    internal List<string> EnsureInitialized()
+    {
+        if (_initialized) return _counters.Keys.ToList();
+        _initialized = true;
+        try
+        {
+            if (!PerformanceCounterCategory.Exists("Processor Information")) return new();
+            var category = new PerformanceCounterCategory("Processor Information");
+            string counterName = category.CounterExists("% Processor Utility") ? "% Processor Utility" : "% Processor Time";
+            string fallbackCategory = counterName == "% Processor Utility" ? "Processor Information" : "Processor";
+
+            foreach (var instance in category.GetInstanceNames().Where(n => n != "_Total").OrderBy(n => n))
+            {
+                try
+                {
+                    var counter = new PerformanceCounter(fallbackCategory, counterName, instance, true);
+                    counter.NextValue();
+                    _counters["thread_" + instance] = counter;
+                }
+                catch { /* bu çekirdek atlanır */ }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("İş parçacığı kullanım sayaçları başlatılamadı: " + ex.Message);
+        }
+        return _counters.Keys.ToList();
+    }
+
+    internal Dictionary<string, SensorReading> PollAll()
+    {
+        var result = new Dictionary<string, SensorReading>();
+        foreach (var kv in _counters)
+        {
+            try
+            {
+                double v = Math.Clamp(kv.Value.NextValue(), 0, 100);
+                result[kv.Key] = new SensorReading { Value = v, Available = true, DigitalText = $"{v:0}%" };
+            }
+            catch
+            {
+                result[kv.Key] = SensorReading.Unavailable();
+            }
+        }
+        return result;
+    }
+
+    public void Dispose()
+    {
+        foreach (var c in _counters.Values) c.Dispose();
+    }
+}
+
+internal sealed class TemperatureSensorManager : IDisposable
+{
+    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(2) };
+    private AppSettings _settings;
+    private string _activeSourceDescription = "Henüz denenmedi";
+
+    internal TemperatureSensorManager(AppSettings settings) => _settings = settings;
+
+    internal void UpdateSettings(AppSettings settings) => _settings = settings;
+
+    internal string ActiveSourceDescription => _activeSourceDescription;
+
+    internal Dictionary<string, SensorReading> Poll(int coreCount)
+    {
+        var readings = TryLibreHardwareMonitorWmi(coreCount);
+        if (readings == null && (_settings.TempSource == TemperatureSource.Auto || _settings.TempSource == TemperatureSource.LibreHardwareMonitorHttp))
+            readings = TryLibreHardwareMonitorHttp(coreCount);
+        if (readings == null && (_settings.TempSource == TemperatureSource.Auto || _settings.TempSource == TemperatureSource.Acpi))
+            readings = TryAcpi(coreCount);
+
+        if (readings != null) return ApplyUnit(readings);
+
+        _activeSourceDescription = "Yok (LibreHardwareMonitor'ü çalıştırın)";
+        var fallback = new Dictionary<string, SensorReading>();
+        for (int i = 0; i < coreCount; i++) fallback[$"cpu_core_{i}"] = SensorReading.Unavailable();
+        fallback["cpu_package"] = SensorReading.Unavailable();
+        return fallback;
+    }
+
+    private Dictionary<string, SensorReading>? TryLibreHardwareMonitorWmi(int coreCount)
+    {
+        if (_settings.TempSource != TemperatureSource.Auto && _settings.TempSource != TemperatureSource.LibreHardwareMonitorWmi)
+            return null;
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(@"root\LibreHardwareMonitor",
+                "SELECT Name, Identifier, Value FROM Sensor WHERE SensorType='Temperature'");
+            var items = searcher.Get().Cast<ManagementObject>()
+                .Where(mo => ((string?)mo["Identifier"])?.Contains("cpu", StringComparison.OrdinalIgnoreCase) == true)
+                .ToList();
+            if (items.Count == 0) return null;
+
+            var result = new Dictionary<string, SensorReading>();
+            foreach (var mo in items)
+            {
+                string name = (string?)mo["Name"] ?? "";
+                float value = Convert.ToSingle(mo["Value"]);
+                ClassifyCpuSensor(name, value, result);
+            }
+            if (result.Count == 0) return null;
+            _activeSourceDescription = "LibreHardwareMonitor (WMI)";
+            return FillMissingCores(result, coreCount);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("LibreHardwareMonitor WMI okunamadı: " + ex.Message);
+            return null;
+        }
+    }
+
+    private Dictionary<string, SensorReading>? TryLibreHardwareMonitorHttp(int coreCount)
+    {
+        try
+        {
+            var url = $"http://localhost:{_settings.LhmHttpPort}/data.json";
+            var json = _http.GetStringAsync(url).GetAwaiter().GetResult();
+            using var doc = JsonDocument.Parse(json);
+
+            var result = new Dictionary<string, SensorReading>();
+            CollectTemperatureNodes(doc.RootElement, result);
+            if (result.Count == 0) return null;
+            _activeSourceDescription = "LibreHardwareMonitor (HTTP)";
+            return FillMissingCores(result, coreCount);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("LibreHardwareMonitor HTTP okunamadı: " + ex.Message);
+            return null;
+        }
+    }
+
+    private void CollectTemperatureNodes(JsonElement node, Dictionary<string, SensorReading> result)
+    {
+        if (node.TryGetProperty("Text", out var textEl) && node.TryGetProperty("Value", out var valueEl))
+        {
+            string text = textEl.GetString() ?? "";
+            string valueStr = valueEl.GetString() ?? "";
+            var m = Regex.Match(valueStr, @"-?\d+[.,]?\d*");
+            if (m.Success && valueStr.Contains('°'))
+            {
+                if (float.TryParse(m.Value.Replace(',', '.'), System.Globalization.CultureInfo.InvariantCulture, out var val))
+                    ClassifyCpuSensor(text, val, result);
+            }
+        }
+        if (node.TryGetProperty("Children", out var children) && children.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var child in children.EnumerateArray())
+                CollectTemperatureNodes(child, result);
+        }
+    }
+
+    private Dictionary<string, SensorReading>? TryAcpi(int coreCount)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(@"root\WMI",
+                "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature");
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                double raw = Convert.ToDouble(mo["CurrentTemperature"]);
+                double celsius = raw / 10.0 - 273.15;
+                _activeSourceDescription = "ACPI (MSAcpi_ThermalZoneTemperature)";
+                var result = new Dictionary<string, SensorReading>
+                {
+                    ["cpu_package"] = new SensorReading { Value = celsius, Available = true, DigitalText = $"{celsius:0.0}°" }
+                };
+                for (int i = 0; i < coreCount; i++) result[$"cpu_core_{i}"] = SensorReading.Unavailable();
+                return result;
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("ACPI sıcaklık bölgesi okunamadı (yönetici yetkisi gerekebilir): " + ex.Message);
+        }
+        return null;
+    }
+
+    private static void ClassifyCpuSensor(string name, float celsius, Dictionary<string, SensorReading> result)
+    {
+        var reading = new SensorReading { Value = celsius, Available = true, DigitalText = $"{celsius:0.0}°" };
+        if (name.Contains("Package", StringComparison.OrdinalIgnoreCase) || name.Contains("Tctl", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("Die", StringComparison.OrdinalIgnoreCase))
+        {
+            result["cpu_package"] = reading;
+            return;
+        }
+        var m = Regex.Match(name, @"Core\s*#?(\d+)", RegexOptions.IgnoreCase);
+        if (m.Success)
+        {
+            int idx = int.Parse(m.Groups[1].Value) - 1;
+            if (idx < 0) idx = 0;
+            result[$"cpu_core_{idx}"] = reading;
+        }
+    }
+
+    private static Dictionary<string, SensorReading> FillMissingCores(Dictionary<string, SensorReading> result, int coreCount)
+    {
+        for (int i = 0; i < coreCount; i++)
+            result.TryAdd($"cpu_core_{i}", SensorReading.Unavailable());
+        result.TryAdd("cpu_package", SensorReading.Unavailable());
+        return result;
+    }
+
+    private Dictionary<string, SensorReading> ApplyUnit(Dictionary<string, SensorReading> readings)
+    {
+        if (!_settings.UseFahrenheit) return readings;
+        var converted = new Dictionary<string, SensorReading>();
+        foreach (var kv in readings)
+        {
+            if (!kv.Value.Available) { converted[kv.Key] = kv.Value; continue; }
+            double f = kv.Value.Value * 9.0 / 5.0 + 32.0;
+            converted[kv.Key] = new SensorReading { Value = f, Available = true, DigitalText = $"{f:0.0}°F" };
+        }
+        return converted;
+    }
+
+    public void Dispose() => _http.Dispose();
+}
+
 #endregion
 
 #region Gösterge Modeli ve Çizimi
@@ -795,27 +1402,47 @@ internal sealed class SensorHub : IDisposable
 {
     private readonly CpuSensor _cpu = new();
     private readonly RamSensor _ram = new();
+    private readonly DiskSensor _disk = new();
+    private readonly NetworkSensorManager _network = new();
+    private readonly GpuSensorManager _gpu = new();
+    private readonly ThreadUsageSensorManager _threads = new();
+    private readonly TemperatureSensorManager _temp;
+    private readonly int _coreCount;
     private System.Threading.Timer? _timer;
     private AppSettings _settings;
     private readonly object _lock = new();
     private volatile bool _busy;
 
     internal event Action? SamplesReady;
+    internal event Action? StructureChanged; // ağ/GPU listesi değişti -> gösterge listesi yeniden kurulmalı
     internal Dictionary<string, SensorReading> Latest { get; } = new();
+    internal int CoreCount => _coreCount;
+    internal string TemperatureSourceDescription => _temp.ActiveSourceDescription;
 
     internal SensorHub(AppSettings settings)
     {
         _settings = settings;
+        _temp = new TemperatureSensorManager(settings);
+        _coreCount = CpuTopology.GetPhysicalCoreCount();
+        _network.DiscoveryChanged += () => StructureChanged?.Invoke();
+        _gpu.DiscoveryChanged += () => StructureChanged?.Invoke();
     }
+
+    internal List<string> NetworkAdapterIds() => _network.CurrentIds();
+    internal List<string> GpuIds() => _gpu.CurrentIds();
+    internal List<string> ThreadIds() => _threads.EnsureInitialized();
+    internal string GpuDisplayName(string id) => _gpu.NameFor(id);
 
     internal void UpdateSettings(AppSettings settings)
     {
         _settings = settings;
+        _temp.UpdateSettings(settings);
         Reschedule();
     }
 
     internal void Start()
     {
+        _threads.EnsureInitialized();
         Reschedule();
     }
 
@@ -832,13 +1459,31 @@ internal sealed class SensorHub : IDisposable
         _busy = true;
         try
         {
-            var cpu = _cpu.Read();
-            var ram = _ram.Read();
+            var snapshot = new Dictionary<string, SensorReading>
+            {
+                ["cpu"] = _cpu.Read(),
+                ["ram"] = _ram.Read(),
+                ["disk_c"] = _disk.Read(),
+            };
+
+            foreach (var kv in _network.PollAll(_settings.HideVirtualAdapters, BuildManualSpeedMap()))
+                snapshot[kv.Key] = kv.Value;
+
+            foreach (var kv in _gpu.PollAll())
+                snapshot[kv.Key] = kv.Value;
+
+            if (_settings.ShowThreadUsageMiniGauges)
+            {
+                foreach (var kv in _threads.PollAll())
+                    snapshot[kv.Key] = kv.Value;
+            }
+
+            foreach (var kv in _temp.Poll(_coreCount))
+                snapshot[kv.Key] = kv.Value;
 
             lock (_lock)
             {
-                Latest["cpu"] = cpu;
-                Latest["ram"] = ram;
+                foreach (var kv in snapshot) Latest[kv.Key] = kv.Value;
             }
             SamplesReady?.Invoke();
         }
@@ -852,6 +1497,10 @@ internal sealed class SensorHub : IDisposable
         }
     }
 
+    private Dictionary<string, double> BuildManualSpeedMap() =>
+        _settings.Gauges.Where(g => g.Kind == GaugeKind.Network && g.ManualMaxMbps > 0)
+            .ToDictionary(g => g.Id, g => g.ManualMaxMbps);
+
     internal SensorReading? TryGet(string id)
     {
         lock (_lock)
@@ -864,6 +1513,11 @@ internal sealed class SensorHub : IDisposable
     {
         _timer?.Dispose();
         _cpu.Dispose();
+        _disk.Dispose();
+        _network.Dispose();
+        _gpu.Dispose();
+        _threads.Dispose();
+        _temp.Dispose();
     }
 }
 
@@ -901,6 +1555,7 @@ internal sealed class GadgetForm : Form
         BackColor = Color.Black;
         TransparencyKey = Color.Black; // UpdateLayeredWindow başarısız olursa yedek yöntem.
 
+        SyncStaticGauges();
         BuildGaugeModels();
         ApplyTopMost();
         PositionWindow();
@@ -910,6 +1565,7 @@ internal sealed class GadgetForm : Form
         _renderTimer.Start();
 
         _hub.SamplesReady += OnSamplesReady;
+        _hub.StructureChanged += OnStructureChanged;
 
         _trayIcon = new NotifyIcon
         {
@@ -964,6 +1620,68 @@ internal sealed class GadgetForm : Form
         }
     }
 
+    private void SyncStaticGauges()
+    {
+        bool changed = false;
+        changed |= EnsureGauge("disk_c", GaugeKind.DiskRead, 70, 90);
+        changed |= EnsureGauge("cpu_package", GaugeKind.CpuPackageTemp, 70, 85);
+        for (int i = 0; i < _hub.CoreCount; i++)
+            changed |= EnsureGauge($"cpu_core_{i}", GaugeKind.CpuCoreTemp, 70, 85);
+        foreach (var tid in _hub.ThreadIds())
+            changed |= EnsureGauge(tid, GaugeKind.ThreadUsage, 80, 95, visible: false);
+
+        if (changed) SettingsManager.Save(_settings);
+    }
+
+    private bool EnsureGauge(string id, GaugeKind kind, double yellow, double red, bool visible = true)
+    {
+        if (_settings.Gauges.Any(g => g.Id == id)) return false;
+        int order = _settings.Gauges.Count == 0 ? 0 : _settings.Gauges.Max(g => g.Order) + 1;
+        _settings.Gauges.Add(new GaugeSettings
+        {
+            Id = id, Kind = kind, Order = order, YellowThreshold = yellow, RedThreshold = red, Visible = visible
+        });
+        return true;
+    }
+
+    private void OnStructureChanged()
+    {
+        if (IsDisposed) return;
+        try { BeginInvoke(new Action(SyncDiscoveredGauges)); }
+        catch (InvalidOperationException) { /* form kapanıyor olabilir */ }
+    }
+
+    private void SyncDiscoveredGauges()
+    {
+        bool changed = false;
+        changed |= SyncDynamicKind(GaugeKind.Network, _hub.NetworkAdapterIds(), 80, 95);
+        changed |= SyncDynamicKind(GaugeKind.Gpu, _hub.GpuIds(), 80, 95);
+
+        if (!changed) return;
+        SettingsManager.Save(_settings);
+        BuildGaugeModels();
+        PositionWindow();
+        RenderTick(force: true);
+    }
+
+    private bool SyncDynamicKind(GaugeKind kind, List<string> discoveredIds, double yellow, double red)
+    {
+        bool changed = false;
+        var existing = _settings.Gauges.Where(g => g.Kind == kind).ToList();
+        var existingIds = existing.Select(g => g.Id).ToHashSet();
+
+        foreach (var id in discoveredIds.Where(id => !existingIds.Contains(id)))
+            changed |= EnsureGauge(id, kind, yellow, red);
+
+        var discoveredSet = discoveredIds.ToHashSet();
+        foreach (var stale in existing.Where(g => !discoveredSet.Contains(g.Id)).ToList())
+        {
+            _settings.Gauges.Remove(stale);
+            changed = true;
+        }
+        return changed;
+    }
+
     private void BuildGaugeModels()
     {
         _gauges.Clear();
@@ -982,18 +1700,24 @@ internal sealed class GadgetForm : Form
         }
     }
 
-    private static string LabelFor(GaugeSettings gs) => gs.Kind switch
+    private string LabelFor(GaugeSettings gs) => gs.Kind switch
     {
         GaugeKind.Cpu => "CPU",
         GaugeKind.Ram => "RAM",
         GaugeKind.DiskRead => "C:",
         GaugeKind.CpuPackageTemp => "Package",
-        GaugeKind.CpuCoreTemp => gs.Id.ToUpperInvariant(),
+        GaugeKind.CpuCoreTemp => "Core " + ExtractTrailingNumber(gs.Id),
         GaugeKind.Network => gs.Id,
-        GaugeKind.Gpu => gs.Id.ToUpperInvariant(),
-        GaugeKind.ThreadUsage => gs.Id.ToUpperInvariant(),
+        GaugeKind.Gpu => _hub.GpuDisplayName(gs.Id),
+        GaugeKind.ThreadUsage => "T" + ExtractTrailingNumber(gs.Id),
         _ => gs.Id
     };
+
+    private static string ExtractTrailingNumber(string id)
+    {
+        var m = Regex.Match(id, @"(\d+)$");
+        return m.Success ? m.Value : id;
+    }
 
     private static GaugeSize SizeFor(GaugeKind kind) => kind switch
     {
@@ -1216,6 +1940,7 @@ internal sealed class GadgetForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _hub.SamplesReady -= OnSamplesReady;
+        _hub.StructureChanged -= OnStructureChanged;
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         _backBuffer?.Dispose();
