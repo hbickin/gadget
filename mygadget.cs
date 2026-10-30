@@ -119,12 +119,45 @@ internal static class NativeMethods
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     internal static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+    // ---- Tek örnek: ikinci açılışta mevcut örneğin ayarlarını açtırma ----
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    internal static extern uint RegisterWindowMessage(string lpString);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    internal static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    internal static readonly IntPtr HWND_BROADCAST = new(0xffff);
+
     // ---- Tam ekran uygulama tespiti ----
     [DllImport("user32.dll")]
     internal static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
     internal static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    internal static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+    internal const int WM_EXITSIZEMOVE = 0x0232;
+
+    // ---- Masaüstü seviyesi (WorkerW) ----
+    internal delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr FindWindow(string? lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr FindWindowEx(IntPtr hWndParent, IntPtr hWndChildAfter, string? lpszClass, string? lpszWindow);
+
+    [DllImport("user32.dll")]
+    internal static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    internal static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    internal static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam,
+        uint flags, uint timeout, out IntPtr result);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct RECT
@@ -220,6 +253,7 @@ public sealed class AppSettings
 
     // Davranış
     public bool AlwaysOnTop { get; set; } = true;
+    public bool DesktopLevel { get; set; } = false;
     public bool PositionLocked { get; set; } = false;
     public bool ClickThrough { get; set; } = false;
     public bool HideOnFullscreenApp { get; set; } = true;
@@ -311,6 +345,37 @@ internal static class Logger
         catch
         {
             // Loglama başarısız olursa yutulur; kullanıcıya mesaj kutusu gösterilmez.
+        }
+    }
+}
+
+[SupportedOSPlatform("windows")]
+internal static class AutoStartManager
+{
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string ValueName = "MyGadget";
+
+    internal static void Apply(bool enabled)
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+            if (key == null) return;
+
+            if (enabled)
+            {
+                string? exePath = Environment.ProcessPath;
+                if (!string.IsNullOrEmpty(exePath))
+                    key.SetValue(ValueName, "\"" + exePath + "\"");
+            }
+            else if (key.GetValue(ValueName) != null)
+            {
+                key.DeleteValue(ValueName, throwOnMissingValue: false);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Windows başlangıç kaydı güncellenemedi: " + ex.Message);
         }
     }
 }
@@ -472,6 +537,7 @@ internal sealed class NetworkAdapterInfo
     public long LastBytesReceived;
     public long LastBytesSent;
     public DateTime LastSampleUtc;
+    public bool HasSample;
 }
 
 internal sealed class NetworkSensorManager : IDisposable
@@ -512,11 +578,12 @@ internal sealed class NetworkSensorManager : IDisposable
                     if (elapsed <= 0) elapsed = 1;
 
                     long rx = stats.BytesReceived, tx = stats.BytesSent;
-                    double downBytesPerSec = info.LastBytesReceived > 0 ? Math.Max(0, rx - info.LastBytesReceived) / elapsed : 0;
-                    double upBytesPerSec = info.LastBytesSent > 0 ? Math.Max(0, tx - info.LastBytesSent) / elapsed : 0;
+                    double downBytesPerSec = info.HasSample ? Math.Max(0, rx - info.LastBytesReceived) / elapsed : 0;
+                    double upBytesPerSec = info.HasSample ? Math.Max(0, tx - info.LastBytesSent) / elapsed : 0;
                     info.LastBytesReceived = rx;
                     info.LastBytesSent = tx;
                     info.LastSampleUtc = now;
+                    info.HasSample = true;
 
                     double speedMbps = manualMaxMbps.TryGetValue(info.Id, out var manual) && manual > 0
                         ? manual
@@ -1077,7 +1144,7 @@ public sealed class GaugeModel
         while (RecentSamples.Count > Math.Max(1, smoothingSamples)) RecentSamples.Dequeue();
         TargetValue = RecentSamples.Average();
 
-        if (TargetValue >= PeakValue || (DateTime.UtcNow - PeakSetAt).TotalSeconds > 0 && PeakValue <= 0)
+        if (TargetValue >= PeakValue)
         {
             PeakValue = TargetValue;
             PeakSetAt = DateTime.UtcNow;
@@ -1537,16 +1604,21 @@ internal sealed class GadgetForm : Form
     private bool _layeredOk = true;
     private readonly NotifyIcon _trayIcon;
     private SettingsForm? _settingsForm;
+    private bool _manualHidden;
+    private bool _attachedToDesktop;
+    private double _fullscreenCheckAccumulatorMs;
+    private readonly uint _showSettingsMessageId;
 
     private const int GaugeWidthLarge = 150;
     private const int GaugeWidthMedium = 108;
     private const int GaugeWidthSmall = 78;
     private const int StripHeight = 185;
 
-    public GadgetForm(AppSettings settings, SensorHub hub)
+    public GadgetForm(AppSettings settings, SensorHub hub, uint showSettingsMessageId)
     {
         _settings = settings;
         _hub = hub;
+        _showSettingsMessageId = showSettingsMessageId;
 
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
         FormBorderStyle = FormBorderStyle.None;
@@ -1574,12 +1646,25 @@ internal sealed class GadgetForm : Form
             Text = "MyGadget"
         };
         var menu = new ContextMenuStrip();
-        menu.Items.Add("Göster/Gizle", null, (_, _) => Visible = !Visible);
+        menu.Items.Add("Göster/Gizle", null, (_, _) => ToggleVisibility());
         menu.Items.Add("Ayarlar...", null, (_, _) => OpenSettings());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Çıkış", null, (_, _) => Application.Exit());
         _trayIcon.ContextMenuStrip = menu;
         _trayIcon.DoubleClick += (_, _) => OpenSettings();
+    }
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        AutoStartManager.Apply(_settings.StartWithWindows);
+        ApplyDesktopLevel();
+    }
+
+    private void ToggleVisibility()
+    {
+        Visible = !Visible;
+        _manualHidden = !Visible; // kullanıcı bilerek gizlediyse tam ekran mantığı onu geri açmasın.
     }
 
     protected override CreateParams CreateParams
@@ -1606,8 +1691,89 @@ internal sealed class GadgetForm : Form
         ApplyTopMost();
         PositionWindow();
         RecreateHandleForStyleChange();
+        AutoStartManager.Apply(settings.StartWithWindows);
+        ApplyDesktopLevel();
         _hub.UpdateSettings(settings);
         RenderTick(force: true);
+    }
+
+    private void ApplyDesktopLevel()
+    {
+        if (!IsHandleCreated) return;
+        if (!_settings.DesktopLevel || _settings.AlwaysOnTop)
+        {
+            RestoreNormalParent();
+            return;
+        }
+
+        try
+        {
+            IntPtr progman = NativeMethods.FindWindow("Progman", null);
+            NativeMethods.SendMessageTimeout(progman, 0x052C, IntPtr.Zero, IntPtr.Zero, 0, 1000, out _);
+
+            IntPtr workerW = IntPtr.Zero;
+            NativeMethods.EnumWindows((hwnd, _) =>
+            {
+                IntPtr shellView = NativeMethods.FindWindowEx(hwnd, IntPtr.Zero, "SHELLDLL_DefView", null);
+                if (shellView != IntPtr.Zero)
+                    workerW = NativeMethods.FindWindowEx(IntPtr.Zero, hwnd, "WorkerW", null);
+                return true;
+            }, IntPtr.Zero);
+
+            if (workerW != IntPtr.Zero)
+            {
+                NativeMethods.SetParent(Handle, workerW);
+                _attachedToDesktop = true;
+            }
+            else
+            {
+                Logger.Log("Masaüstü seviyesi: WorkerW penceresi bulunamadı, normal pencere modu kullanılacak.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Masaüstü seviyesi uygulanamadı: " + ex.Message);
+        }
+    }
+
+    private void RestoreNormalParent()
+    {
+        if (!_attachedToDesktop) return;
+        try
+        {
+            NativeMethods.SetParent(Handle, IntPtr.Zero);
+        }
+        catch (Exception ex)
+        {
+            Logger.Log("Masaüstü seviyesinden çıkılamadı: " + ex.Message);
+        }
+        finally
+        {
+            _attachedToDesktop = false;
+        }
+    }
+
+    private bool IsFullscreenAppActive()
+    {
+        try
+        {
+            IntPtr fg = NativeMethods.GetForegroundWindow();
+            if (fg == IntPtr.Zero || fg == Handle) return false;
+
+            var sb = new System.Text.StringBuilder(256);
+            NativeMethods.GetClassName(fg, sb, sb.Capacity);
+            string cls = sb.ToString();
+            if (cls is "Progman" or "WorkerW" or "Shell_TrayWnd" or "DV2ControlHost") return false;
+
+            if (!NativeMethods.GetWindowRect(fg, out var rect)) return false;
+            var screen = Screen.FromHandle(fg);
+            return rect.Left <= screen.Bounds.Left && rect.Top <= screen.Bounds.Top &&
+                   rect.Right >= screen.Bounds.Right && rect.Bottom >= screen.Bounds.Bottom;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private void RecreateHandleForStyleChange()
@@ -1791,6 +1957,8 @@ internal sealed class GadgetForm : Form
 
     private void RenderTick(bool force = false)
     {
+        CheckFullscreenHide();
+
         bool anyAnimating = force;
         double nowSeconds = _clock.Elapsed.TotalSeconds;
 
@@ -1808,6 +1976,18 @@ internal sealed class GadgetForm : Form
         if (!anyAnimating && !force) return;
 
         Compose(nowSeconds * 1000.0);
+    }
+
+    private void CheckFullscreenHide()
+    {
+        if (!_settings.HideOnFullscreenApp || _manualHidden) return;
+
+        _fullscreenCheckAccumulatorMs += _renderTimer.Interval;
+        if (_fullscreenCheckAccumulatorMs < 500) return;
+        _fullscreenCheckAccumulatorMs = 0;
+
+        bool shouldHide = IsFullscreenAppActive();
+        if (Visible == shouldHide) Visible = !shouldHide;
     }
 
     private void Compose(double blinkPhaseMs)
@@ -1912,11 +2092,25 @@ internal sealed class GadgetForm : Form
 
     protected override void WndProc(ref Message m)
     {
+        if (_showSettingsMessageId != 0 && (uint)m.Msg == _showSettingsMessageId)
+        {
+            // İkinci bir MyGadget örneği başlatılmaya çalışıldı; onun yerine ayarları açıyoruz.
+            OpenSettings();
+            return;
+        }
         if (m.Msg == NativeMethods.WM_LBUTTONDOWN && !_settings.PositionLocked && !_settings.ClickThrough)
         {
             NativeMethods.ReleaseCapture();
             NativeMethods.SendMessage(Handle, NativeMethods.WM_NCLBUTTONDOWN, (IntPtr)NativeMethods.HTCAPTION, IntPtr.Zero);
             return;
+        }
+        if (m.Msg == NativeMethods.WM_EXITSIZEMOVE && !_settings.PositionLocked)
+        {
+            // Kullanıcı sürükleyerek taşıdı; konumu "Serbest" moda alıp kalıcı hâle getir.
+            _settings.Position = DockPosition.Free;
+            _settings.FreeX = Left;
+            _settings.FreeY = Top;
+            SettingsManager.Save(_settings);
         }
         base.WndProc(ref m);
     }
@@ -1931,7 +2125,7 @@ internal sealed class GadgetForm : Form
     {
         if (_settingsForm == null || _settingsForm.IsDisposed)
         {
-            _settingsForm = new SettingsForm(_settings, ApplySettings);
+            _settingsForm = new SettingsForm(_settings, ApplySettings, LabelFor);
         }
         _settingsForm.Show();
         _settingsForm.Activate();
@@ -1957,42 +2151,417 @@ internal sealed class SettingsForm : Form
 {
     private readonly AppSettings _working;
     private readonly Action<AppSettings> _apply;
+    private readonly Func<GaugeSettings, string> _nameResolver;
 
-    public SettingsForm(AppSettings current, Action<AppSettings> apply)
+    private DataGridView _gaugeGrid = null!;
+    private List<GaugeRow> _gaugeRows = new();
+
+    // Veri
+    private NumericUpDown _updateIntervalInput = null!;
+    private NumericUpDown _smoothingInput = null!;
+    private NumericUpDown _dampingInput = null!;
+    private CheckBox _peakEnabledInput = null!;
+    private NumericUpDown _peakHoldInput = null!;
+    private ComboBox _tempSourceInput = null!;
+    private NumericUpDown _lhmPortInput = null!;
+    private ComboBox _tempUnitInput = null!;
+    private CheckBox _hideVirtualInput = null!;
+    private CheckBox _threadMiniInput = null!;
+
+    // Görünüm
+    private NumericUpDown _scaleInput = null!;
+    private NumericUpDown _spacingInput = null!;
+    private ComboBox _themeInput = null!;
+    private NumericUpDown _opacityInput = null!;
+    private ComboBox _positionInput = null!;
+    private ComboBox _monitorInput = null!;
+    private CheckBox _showDigitalInput = null!;
+    private CheckBox _showLabelsInput = null!;
+    private CheckBox _ledsEnabledInput = null!;
+    private NumericUpDown _ledYellowBlinkInput = null!;
+    private NumericUpDown _ledRedBlinkInput = null!;
+    private NumericUpDown _ledHysteresisInput = null!;
+    private NumericUpDown _ledDelayInput = null!;
+
+    // Davranış
+    private CheckBox _alwaysOnTopInput = null!;
+    private CheckBox _desktopLevelInput = null!;
+    private CheckBox _positionLockedInput = null!;
+    private CheckBox _clickThroughInput = null!;
+    private CheckBox _hideFullscreenInput = null!;
+    private CheckBox _startWithWindowsInput = null!;
+
+    public SettingsForm(AppSettings current, Action<AppSettings> apply, Func<GaugeSettings, string> nameResolver)
     {
         _working = Clone(current);
         _apply = apply;
+        _nameResolver = nameResolver;
 
         Text = "MyGadget - Ayarlar";
-        Width = 420;
-        Height = 220;
+        Width = 580;
+        Height = 560;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
-        var info = new Label
-        {
-            Text = "Ayarlar penceresi aşama aşama genişletilecek.\n(Göstergeler / Veri / Görünüm / Davranış sekmeleri)",
-            AutoSize = false,
-            Dock = DockStyle.Top,
-            Height = 90,
-            TextAlign = ContentAlignment.MiddleCenter
-        };
+        var tabs = new TabControl { Dock = DockStyle.Fill };
+        tabs.TabPages.Add(BuildGaugesTab());
+        tabs.TabPages.Add(BuildDataTab());
+        tabs.TabPages.Add(BuildAppearanceTab());
+        tabs.TabPages.Add(BuildBehaviorTab());
 
-        var applyBtn = new Button { Text = "Uygula", DialogResult = DialogResult.OK };
+        var applyBtn = new Button { Text = "Uygula" };
+        var okBtn = new Button { Text = "Tamam" };
         var cancelBtn = new Button { Text = "İptal", DialogResult = DialogResult.Cancel };
-        var panel = new FlowLayoutPanel { Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, Height = 40 };
-        panel.Controls.Add(cancelBtn);
-        panel.Controls.Add(applyBtn);
+        var resetBtn = new Button { Text = "Varsayılanlara dön" };
+        var buttonPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Bottom, FlowDirection = FlowDirection.RightToLeft, Height = 44, Padding = new Padding(8)
+        };
+        buttonPanel.Controls.Add(cancelBtn);
+        buttonPanel.Controls.Add(okBtn);
+        buttonPanel.Controls.Add(applyBtn);
+        buttonPanel.Controls.Add(resetBtn);
 
-        Controls.Add(info);
-        Controls.Add(panel);
+        Controls.Add(tabs);
+        Controls.Add(buttonPanel);
 
-        AcceptButton = applyBtn;
+        AcceptButton = okBtn;
         CancelButton = cancelBtn;
 
-        applyBtn.Click += (_, _) => { _apply(_working); };
+        applyBtn.Click += (_, _) => ApplyWorking();
+        okBtn.Click += (_, _) => { ApplyWorking(); Close(); };
+        resetBtn.Click += (_, _) => ResetToDefaults();
+    }
+
+    private sealed class GaugeRow
+    {
+        public GaugeSettings Settings { get; }
+        public string Name { get; }
+
+        public GaugeRow(GaugeSettings settings, string name)
+        {
+            Settings = settings;
+            Name = name;
+        }
+
+        public bool Visible { get => Settings.Visible; set => Settings.Visible = value; }
+        public double Yellow { get => Settings.YellowThreshold; set => Settings.YellowThreshold = value; }
+        public double Red { get => Settings.RedThreshold; set => Settings.RedThreshold = value; }
+        public double ManualMbps { get => Settings.ManualMaxMbps; set => Settings.ManualMaxMbps = value; }
+    }
+
+    private TabPage BuildGaugesTab()
+    {
+        var page = new TabPage("Göstergeler");
+
+        _gaugeGrid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AutoGenerateColumns = false,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            RowHeadersVisible = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            MultiSelect = false,
+        };
+        _gaugeGrid.Columns.Add(new DataGridViewCheckBoxColumn { DataPropertyName = "Visible", HeaderText = "Göster", Width = 55 });
+        _gaugeGrid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Name", HeaderText = "Gösterge", ReadOnly = true, Width = 150 });
+        _gaugeGrid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Yellow", HeaderText = "Sarı Eşik", Width = 80 });
+        _gaugeGrid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Red", HeaderText = "Kırmızı Eşik", Width = 90 });
+        _gaugeGrid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "ManualMbps", HeaderText = "Maks Mbps (ağ)", Width = 100 });
+
+        RefreshGaugeGrid();
+
+        var upBtn = new Button { Text = "▲ Yukarı", Width = 90 };
+        var downBtn = new Button { Text = "▼ Aşağı", Width = 90 };
+        upBtn.Click += (_, _) => MoveSelectedGauge(-1);
+        downBtn.Click += (_, _) => MoveSelectedGauge(1);
+        var btnPanel = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 36, Padding = new Padding(4) };
+        btnPanel.Controls.Add(upBtn);
+        btnPanel.Controls.Add(downBtn);
+
+        page.Controls.Add(_gaugeGrid);
+        page.Controls.Add(btnPanel);
+        return page;
+    }
+
+    private void RefreshGaugeGrid()
+    {
+        _gaugeRows = _working.Gauges
+            .Where(g => g.Kind != GaugeKind.ThreadUsage) // bu grup "Veri" sekmesindeki tek anahtarla kontrol edilir.
+            .OrderBy(g => g.Order)
+            .Select(g => new GaugeRow(g, _nameResolver(g)))
+            .ToList();
+        _gaugeGrid.DataSource = null;
+        _gaugeGrid.DataSource = _gaugeRows;
+    }
+
+    private void MoveSelectedGauge(int direction)
+    {
+        _gaugeGrid.EndEdit();
+        if (_gaugeGrid.CurrentRow == null) return;
+        int idx = _gaugeGrid.CurrentRow.Index;
+        int newIdx = idx + direction;
+        if (newIdx < 0 || newIdx >= _gaugeRows.Count) return;
+
+        (_gaugeRows[idx].Settings.Order, _gaugeRows[newIdx].Settings.Order) =
+            (_gaugeRows[newIdx].Settings.Order, _gaugeRows[idx].Settings.Order);
+
+        RefreshGaugeGrid();
+        if (newIdx < _gaugeGrid.Rows.Count)
+            _gaugeGrid.CurrentCell = _gaugeGrid.Rows[newIdx].Cells[0];
+    }
+
+    private TabPage BuildDataTab()
+    {
+        var page = new TabPage("Veri");
+        var layout = NewFormLayout();
+
+        _updateIntervalInput = new NumericUpDown { Minimum = 250, Maximum = 5000, Increment = 50, Value = _working.UpdateIntervalMs };
+        AddRow(layout, "Güncelleme aralığı (ms):", _updateIntervalInput);
+
+        _smoothingInput = new NumericUpDown { Minimum = 1, Maximum = 20, Value = _working.SmoothingSamples };
+        AddRow(layout, "Yumuşatma örnek sayısı:", _smoothingInput);
+
+        _dampingInput = new NumericUpDown { Minimum = 0.01m, Maximum = 1.00m, DecimalPlaces = 2, Increment = 0.01m, Value = (decimal)_working.NeedleDamping };
+        AddRow(layout, "İbre sönüm/hız katsayısı (0-1):", _dampingInput);
+
+        _peakEnabledInput = new CheckBox { Checked = _working.PeakNeedleEnabled, Text = "Etkin", AutoSize = true };
+        AddRow(layout, "Tepe değer ibresi:", _peakEnabledInput);
+
+        _peakHoldInput = new NumericUpDown { Minimum = 1, Maximum = 30, Value = _working.PeakHoldSeconds };
+        AddRow(layout, "Tepe değer tutma süresi (sn):", _peakHoldInput);
+
+        _tempSourceInput = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        _tempSourceInput.Items.AddRange(new object[] { "Otomatik", "LibreHardwareMonitor WMI", "LibreHardwareMonitor HTTP", "ACPI" });
+        _tempSourceInput.SelectedIndex = (int)_working.TempSource;
+        AddRow(layout, "Sıcaklık kaynağı:", _tempSourceInput);
+
+        _lhmPortInput = new NumericUpDown { Minimum = 1, Maximum = 65535, Value = _working.LhmHttpPort };
+        AddRow(layout, "LHM HTTP portu:", _lhmPortInput);
+
+        _tempUnitInput = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        _tempUnitInput.Items.AddRange(new object[] { "°C", "°F" });
+        _tempUnitInput.SelectedIndex = _working.UseFahrenheit ? 1 : 0;
+        AddRow(layout, "Sıcaklık birimi:", _tempUnitInput);
+
+        _hideVirtualInput = new CheckBox { Checked = _working.HideVirtualAdapters, Text = "Gizle", AutoSize = true };
+        AddRow(layout, "Sanal/VPN adaptörleri:", _hideVirtualInput);
+
+        _threadMiniInput = new CheckBox { Checked = _working.ShowThreadUsageMiniGauges, Text = "Göster", AutoSize = true };
+        AddRow(layout, "İş parçacığı kullanım mini göstergeleri:", _threadMiniInput);
+
+        page.Controls.Add(layout);
+        return page;
+    }
+
+    private TabPage BuildAppearanceTab()
+    {
+        var page = new TabPage("Görünüm");
+        var layout = NewFormLayout();
+
+        _scaleInput = new NumericUpDown { Minimum = 50, Maximum = 200, Value = _working.ScalePercent };
+        AddRow(layout, "Ölçek (%):", _scaleInput);
+
+        _spacingInput = new NumericUpDown { Minimum = 0, Maximum = 50, Value = _working.GaugeSpacing };
+        AddRow(layout, "Göstergeler arası boşluk:", _spacingInput);
+
+        _themeInput = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        _themeInput.Items.AddRange(new object[] { "Krom (klasik)", "Koyu spor", "Açık", "Retro" });
+        _themeInput.SelectedIndex = (int)_working.Theme;
+        AddRow(layout, "Tema:", _themeInput);
+
+        _opacityInput = new NumericUpDown { Minimum = 30, Maximum = 100, Value = _working.OpacityPercent };
+        AddRow(layout, "Saydamlık (%):", _opacityInput);
+
+        _positionInput = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        _positionInput.Items.AddRange(new object[] { "Üst-orta", "Üst-sol", "Üst-sağ", "Serbest" });
+        _positionInput.SelectedIndex = (int)_working.Position;
+        AddRow(layout, "Konum:", _positionInput);
+
+        _monitorInput = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        _monitorInput.Items.Add("(Birincil ekran)");
+        foreach (var s in Screen.AllScreens) _monitorInput.Items.Add(s.DeviceName);
+        int monitorIdx = 0;
+        if (!string.IsNullOrEmpty(_working.MonitorDeviceName))
+        {
+            int found = Array.FindIndex(Screen.AllScreens, s => s.DeviceName == _working.MonitorDeviceName);
+            if (found >= 0) monitorIdx = found + 1;
+        }
+        _monitorInput.SelectedIndex = monitorIdx;
+        AddRow(layout, "Monitör:", _monitorInput);
+
+        _showDigitalInput = new CheckBox { Checked = _working.ShowDigitalValues, Text = "Göster", AutoSize = true };
+        AddRow(layout, "Dijital değerler:", _showDigitalInput);
+
+        _showLabelsInput = new CheckBox { Checked = _working.ShowLabels, Text = "Göster", AutoSize = true };
+        AddRow(layout, "Etiketler:", _showLabelsInput);
+
+        _ledsEnabledInput = new CheckBox { Checked = _working.LedsEnabled, Text = "Etkin", AutoSize = true };
+        AddRow(layout, "LED uyarı lambaları:", _ledsEnabledInput);
+
+        _ledYellowBlinkInput = new NumericUpDown { Minimum = 80, Maximum = 2000, Increment = 20, Value = _working.LedYellowBlinkMs };
+        AddRow(layout, "Sarı LED yanıp sönme (ms):", _ledYellowBlinkInput);
+
+        _ledRedBlinkInput = new NumericUpDown { Minimum = 80, Maximum = 2000, Increment = 20, Value = _working.LedRedBlinkMs };
+        AddRow(layout, "Kırmızı LED yanıp sönme (ms):", _ledRedBlinkInput);
+
+        _ledHysteresisInput = new NumericUpDown { Minimum = 0, Maximum = 20, DecimalPlaces = 1, Increment = 0.5m, Value = (decimal)_working.LedHysteresis };
+        AddRow(layout, "LED histerezis:", _ledHysteresisInput);
+
+        _ledDelayInput = new NumericUpDown { Minimum = 0, Maximum = 30, Value = _working.LedDelaySeconds };
+        AddRow(layout, "LED gecikme süresi (sn):", _ledDelayInput);
+
+        page.Controls.Add(layout);
+        return page;
+    }
+
+    private TabPage BuildBehaviorTab()
+    {
+        var page = new TabPage("Davranış");
+        var layout = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(14)
+        };
+
+        _alwaysOnTopInput = new CheckBox { Text = "Her zaman üstte", Checked = _working.AlwaysOnTop, AutoSize = true };
+        _desktopLevelInput = new CheckBox { Text = "Masaüstü seviyesinde (diğer pencerelerin altında)", Checked = _working.DesktopLevel, AutoSize = true };
+        _positionLockedInput = new CheckBox { Text = "Konumu kilitle", Checked = _working.PositionLocked, AutoSize = true };
+        _clickThroughInput = new CheckBox { Text = "Fare tıklamalarını geçir (click-through)", Checked = _working.ClickThrough, AutoSize = true };
+        var note = new Label
+        {
+            Text = "Not: click-through açıkken ayarlara sistem tepsisi simgesinden ulaşabilirsiniz.",
+            AutoSize = true, Margin = new Padding(20, 0, 0, 10), ForeColor = Color.DimGray
+        };
+        _hideFullscreenInput = new CheckBox { Text = "Tam ekran uygulama/oyun açıkken gizle", Checked = _working.HideOnFullscreenApp, AutoSize = true };
+        _startWithWindowsInput = new CheckBox { Text = "Windows ile başlat", Checked = _working.StartWithWindows, AutoSize = true };
+
+        var exitBtn = new Button { Text = "MyGadget'tan Çık", AutoSize = true, Margin = new Padding(0, 24, 0, 0) };
+        exitBtn.Click += (_, _) => Application.Exit();
+
+        layout.Controls.Add(_alwaysOnTopInput);
+        layout.Controls.Add(_desktopLevelInput);
+        layout.Controls.Add(_positionLockedInput);
+        layout.Controls.Add(_clickThroughInput);
+        layout.Controls.Add(note);
+        layout.Controls.Add(_hideFullscreenInput);
+        layout.Controls.Add(_startWithWindowsInput);
+        layout.Controls.Add(exitBtn);
+
+        page.Controls.Add(layout);
+        return page;
+    }
+
+    private static TableLayoutPanel NewFormLayout()
+    {
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(10), AutoScroll = true };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42));
+        return layout;
+    }
+
+    private static void AddRow(TableLayoutPanel layout, string label, Control control)
+    {
+        int row = layout.Controls.Count / layout.ColumnCount;
+        layout.Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 7, 6, 7) }, 0, row);
+        control.Anchor = AnchorStyles.Left;
+        control.Margin = new Padding(0, 4, 0, 4);
+        if (control.Width < 90) control.Width = 130;
+        layout.Controls.Add(control, 1, row);
+    }
+
+    private void ApplyWorking()
+    {
+        _gaugeGrid.EndEdit();
+
+        _working.UpdateIntervalMs = (int)_updateIntervalInput.Value;
+        _working.SmoothingSamples = (int)_smoothingInput.Value;
+        _working.NeedleDamping = (double)_dampingInput.Value;
+        _working.PeakNeedleEnabled = _peakEnabledInput.Checked;
+        _working.PeakHoldSeconds = (int)_peakHoldInput.Value;
+        _working.TempSource = (TemperatureSource)_tempSourceInput.SelectedIndex;
+        _working.LhmHttpPort = (int)_lhmPortInput.Value;
+        _working.UseFahrenheit = _tempUnitInput.SelectedIndex == 1;
+        _working.HideVirtualAdapters = _hideVirtualInput.Checked;
+        _working.ShowThreadUsageMiniGauges = _threadMiniInput.Checked;
+
+        _working.ScalePercent = (int)_scaleInput.Value;
+        _working.GaugeSpacing = (int)_spacingInput.Value;
+        _working.Theme = (AppTheme)_themeInput.SelectedIndex;
+        _working.OpacityPercent = (int)_opacityInput.Value;
+        _working.Position = (DockPosition)_positionInput.SelectedIndex;
+        _working.MonitorDeviceName = _monitorInput.SelectedIndex <= 0 ? null : Screen.AllScreens[_monitorInput.SelectedIndex - 1].DeviceName;
+        _working.ShowDigitalValues = _showDigitalInput.Checked;
+        _working.ShowLabels = _showLabelsInput.Checked;
+        _working.LedsEnabled = _ledsEnabledInput.Checked;
+        _working.LedYellowBlinkMs = (int)_ledYellowBlinkInput.Value;
+        _working.LedRedBlinkMs = (int)_ledRedBlinkInput.Value;
+        _working.LedHysteresis = (double)_ledHysteresisInput.Value;
+        _working.LedDelaySeconds = (int)_ledDelayInput.Value;
+
+        _working.AlwaysOnTop = _alwaysOnTopInput.Checked;
+        _working.DesktopLevel = _desktopLevelInput.Checked;
+        _working.PositionLocked = _positionLockedInput.Checked;
+        _working.ClickThrough = _clickThroughInput.Checked;
+        _working.HideOnFullscreenApp = _hideFullscreenInput.Checked;
+        _working.StartWithWindows = _startWithWindowsInput.Checked;
+
+        foreach (var g in _working.Gauges.Where(g => g.Kind == GaugeKind.ThreadUsage))
+            g.Visible = _working.ShowThreadUsageMiniGauges;
+
+        // Gösterge satırlarındaki Göster/Eşik/Mbps değerleri DataGridView bağlamasıyla
+        // zaten doğrudan GaugeSettings nesnelerine yazılmış durumda.
+
+        SettingsManager.Save(_working);
+        _apply(Clone(_working));
+    }
+
+    private void ResetToDefaults()
+    {
+        var d = AppSettings.CreateDefault();
+
+        _updateIntervalInput.Value = d.UpdateIntervalMs;
+        _smoothingInput.Value = d.SmoothingSamples;
+        _dampingInput.Value = (decimal)d.NeedleDamping;
+        _peakEnabledInput.Checked = d.PeakNeedleEnabled;
+        _peakHoldInput.Value = d.PeakHoldSeconds;
+        _tempSourceInput.SelectedIndex = (int)d.TempSource;
+        _lhmPortInput.Value = d.LhmHttpPort;
+        _tempUnitInput.SelectedIndex = d.UseFahrenheit ? 1 : 0;
+        _hideVirtualInput.Checked = d.HideVirtualAdapters;
+        _threadMiniInput.Checked = d.ShowThreadUsageMiniGauges;
+
+        _scaleInput.Value = d.ScalePercent;
+        _spacingInput.Value = d.GaugeSpacing;
+        _themeInput.SelectedIndex = (int)d.Theme;
+        _opacityInput.Value = d.OpacityPercent;
+        _positionInput.SelectedIndex = (int)d.Position;
+        _monitorInput.SelectedIndex = 0;
+        _showDigitalInput.Checked = d.ShowDigitalValues;
+        _showLabelsInput.Checked = d.ShowLabels;
+        _ledsEnabledInput.Checked = d.LedsEnabled;
+        _ledYellowBlinkInput.Value = d.LedYellowBlinkMs;
+        _ledRedBlinkInput.Value = d.LedRedBlinkMs;
+        _ledHysteresisInput.Value = (decimal)d.LedHysteresis;
+        _ledDelayInput.Value = d.LedDelaySeconds;
+
+        _alwaysOnTopInput.Checked = d.AlwaysOnTop;
+        _desktopLevelInput.Checked = d.DesktopLevel;
+        _positionLockedInput.Checked = d.PositionLocked;
+        _clickThroughInput.Checked = d.ClickThrough;
+        _hideFullscreenInput.Checked = d.HideOnFullscreenApp;
+        _startWithWindowsInput.Checked = d.StartWithWindows;
+
+        foreach (var row in _gaugeRows)
+        {
+            row.Settings.YellowThreshold = row.Settings.Kind == GaugeKind.Gpu ? 80 : 70;
+            row.Settings.RedThreshold = row.Settings.Kind == GaugeKind.Gpu ? 95 : 90;
+            row.Settings.Visible = true;
+            row.Settings.ManualMaxMbps = 0;
+        }
+        RefreshGaugeGrid();
     }
 
     private static AppSettings Clone(AppSettings s)
@@ -2012,11 +2581,14 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        uint showSettingsMessageId = NativeMethods.RegisterWindowMessage("MyGadget_ShowSettings_8F2C2B1E");
+
         using var mutex = new Mutex(true, "MyGadget_SingleInstance_8F2C2B1E", out bool createdNew);
         if (!createdNew)
         {
-            // Zaten çalışan bir örnek var; onun ayarlarını açmasını isteyelim ve çıkalım.
-            Logger.Log("Başka bir MyGadget örneği zaten çalışıyor.");
+            // Zaten çalışan bir örnek var; onun ayarlarını açmasını isteyip çıkalım.
+            NativeMethods.PostMessage(NativeMethods.HWND_BROADCAST, showSettingsMessageId, IntPtr.Zero, IntPtr.Zero);
+            Logger.Log("Başka bir MyGadget örneği zaten çalışıyor; ayarlar penceresi açılması istendi.");
             return;
         }
 
@@ -2033,7 +2605,7 @@ internal static class Program
         using var hub = new SensorHub(settings);
         hub.Start();
 
-        using var form = new GadgetForm(settings, hub);
+        using var form = new GadgetForm(settings, hub, showSettingsMessageId);
         form.Show();
 
         Application.Run();
