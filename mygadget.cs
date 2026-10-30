@@ -224,7 +224,7 @@ public sealed class AppSettings
 {
     // Veri
     public int UpdateIntervalMs { get; set; } = 1000;
-    public int SmoothingSamples { get; set; } = 4;
+    public int SmoothingSamples { get; set; } = 1;
     public double NeedleDamping { get; set; } = 0.22; // 0..1, yüksek = daha hızlı
     public bool PeakNeedleEnabled { get; set; } = true;
     public int PeakHoldSeconds { get; set; } = 4;
@@ -1316,6 +1316,7 @@ public sealed class GaugeModel
     public DateTime PeakSetAt;
     public bool Available = true;
     public string DigitalText = "N/A";
+    public string? LastRenderedDigitalText; // yalnızca ibre/LED hareketsizken metin değişikliğini yakalamak için.
     public double YellowThreshold = 70;
     public double RedThreshold = 85;
     public readonly LedState Led = new();
@@ -2235,6 +2236,11 @@ internal sealed class GadgetForm : Form
                 _settings.LedDelaySeconds, nowSeconds);
             if (gm.Led.Active) anyAnimating = true; // yanıp sönme sürdüğü için çizim devam etmeli.
             if (wasActive != gm.Led.Active) anyAnimating = true;
+
+            // İbre zaten hedefteyken (ör. değer sabit kalıyor) bile dijital metin değişmiş
+            // olabilir (ör. "3.2 MB/s" -> "3.4 MB/s"); bu durumda da yeniden çizilmeli,
+            // yoksa ekrandaki mavi değer gerçek değerin gerisinde kalıp bayatlar.
+            if (gm.DigitalText != gm.LastRenderedDigitalText) anyAnimating = true;
         }
 
         string visibleSignature = string.Join(",", _gauges.Where(g => g.Available).Select(g => g.Id));
@@ -2302,6 +2308,8 @@ internal sealed class GadgetForm : Form
                 x += gw + _settings.GaugeSpacing * scale;
             }
         }
+
+        foreach (var gm in _gauges) gm.LastRenderedDigitalText = gm.DigitalText;
 
         Present();
     }
