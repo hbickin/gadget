@@ -1217,13 +1217,13 @@ internal static class GaugePainter
     private const float StartAngle = 135f; // derece, 0 saat 3 pozisyonundan itibaren
     private const float SweepAngle = 270f;
 
-    internal static void DrawGauge(Graphics g, RectangleF bounds, GaugeModel model, AppSettings settings)
+    internal static void DrawGauge(Graphics g, RectangleF bounds, GaugeModel model, AppSettings settings, double blinkPhaseMs)
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
 
-        float dialSize = Math.Min(bounds.Width, bounds.Height * 0.78f);
-        var dialRect = new RectangleF(bounds.X + (bounds.Width - dialSize) / 2f, bounds.Y, dialSize, dialSize);
+        float dialSize = Math.Min(bounds.Width, bounds.Height);
+        var dialRect = new RectangleF(bounds.X + (bounds.Width - dialSize) / 2f, bounds.Y + (bounds.Height - dialSize) / 2f, dialSize, dialSize);
 
         DrawBezel(g, dialRect, settings.Theme);
 
@@ -1249,11 +1249,17 @@ internal static class GaugePainter
 
         DrawHub(g, faceRect, settings.Theme);
 
+        // Etiket ve dijital değer, 20-80 taksimatlarının kapladığı iç alana (göbeğin
+        // üstü/altı) yazılır; LED ise kadranın alt boşluğuna (0 ile 100 arasındaki
+        // boş yay) yerleştirilir — artık dairenin dışında/altında değil.
         if (settings.ShowLabels)
-            DrawLabel(g, bounds, dialRect, model.Label, settings.Theme);
+            DrawLabel(g, faceRect, model.Label, settings.Theme);
 
         if (settings.ShowDigitalValues)
-            DrawDigital(g, bounds, dialRect, model.DigitalText, settings.Theme);
+            DrawDigital(g, faceRect, model.DigitalText, settings.Theme);
+
+        if (settings.LedsEnabled)
+            DrawLedInGap(g, faceRect, model, settings, blinkPhaseMs);
     }
 
     private static RectangleF Inflate(RectangleF r, float amount)
@@ -1389,22 +1395,36 @@ internal static class GaugePainter
         g.FillEllipse(brush, hubRect);
     }
 
-    private static void DrawLabel(Graphics g, RectangleF bounds, RectangleF dialRect, string label, AppTheme theme)
+    private static void DrawLabel(Graphics g, RectangleF faceRect, string label, AppTheme theme)
     {
-        using var font = new Font("Segoe UI", bounds.Width * 0.09f, FontStyle.Bold);
+        // "20" taksimatının biraz üstü, göbeğin üstü: kadranın üst-orta iç bölgesi.
+        using var font = new Font("Segoe UI", faceRect.Width * 0.095f, FontStyle.Bold);
         using var brush = new SolidBrush(theme == AppTheme.Light ? Color.FromArgb(40, 40, 40) : Color.White);
         var size = g.MeasureString(label, font);
-        float y = dialRect.Bottom + bounds.Height * 0.02f;
-        g.DrawString(label, font, brush, bounds.X + (bounds.Width - size.Width) / 2, y);
+        float y = faceRect.Y + faceRect.Height * 0.24f - size.Height / 2;
+        g.DrawString(label, font, brush, faceRect.X + (faceRect.Width - size.Width) / 2, y);
     }
 
-    private static void DrawDigital(Graphics g, RectangleF bounds, RectangleF dialRect, string text, AppTheme theme)
+    private static void DrawDigital(Graphics g, RectangleF faceRect, string text, AppTheme theme)
     {
-        using var font = new Font("Consolas", bounds.Width * 0.085f, FontStyle.Regular);
+        // Göbeğin altı, "80" taksimatının biraz üstü: kadranın alt-orta iç bölgesi
+        // (LED'in oturduğu en alt boşluk hariç).
+        using var font = new Font("Consolas", faceRect.Width * 0.085f, FontStyle.Regular);
         using var brush = new SolidBrush(theme == AppTheme.Light ? Color.FromArgb(70, 70, 70) : Color.FromArgb(0, 220, 255));
         var size = g.MeasureString(text, font);
-        float y = bounds.Bottom - size.Height;
-        g.DrawString(text, font, brush, bounds.X + (bounds.Width - size.Width) / 2, y);
+        float y = faceRect.Y + faceRect.Height * 0.63f - size.Height / 2;
+        g.DrawString(text, font, brush, faceRect.X + (faceRect.Width - size.Width) / 2, y);
+    }
+
+    private static void DrawLedInGap(Graphics g, RectangleF faceRect, GaugeModel model, AppSettings settings, double blinkPhaseMs)
+    {
+        // 0 ve 100 taksimatları arasındaki boş yay, kadranın alt-orta kısmında kalır
+        // (StartAngle=135°, Sweep=270° => boşluk 45°-135° arası, yani tam alt-orta).
+        float ledSize = faceRect.Width * 0.16f;
+        float cx = faceRect.X + faceRect.Width / 2f;
+        float cy = faceRect.Y + faceRect.Height * 0.80f;
+        var ledRect = new RectangleF(cx - ledSize / 2, cy - ledSize / 2, ledSize, ledSize);
+        DrawLed(g, ledRect, model, settings, blinkPhaseMs);
     }
 
     private static float ValueToSweepFraction(double value) => (float)Math.Clamp(value / 100.0, 0, 1);
@@ -1607,6 +1627,7 @@ internal sealed class GadgetForm : Form
     private bool _manualHidden;
     private bool _attachedToDesktop;
     private double _fullscreenCheckAccumulatorMs;
+    private string _lastVisibleSignature = "";
     private readonly uint _showSettingsMessageId;
 
     private const int GaugeWidthLarge = 150;
@@ -1902,15 +1923,50 @@ internal sealed class GadgetForm : Form
         _ => GaugeSize.Medium
     };
 
+    private readonly struct GaugeSlot
+    {
+        public readonly GaugeModel Primary;
+        public readonly GaugeModel? Secondary; // alt alta eşlenmiş ikinci çekirdek (varsa)
+        public readonly int WidthBase;
+
+        public GaugeSlot(GaugeModel primary, GaugeModel? secondary, int widthBase)
+        {
+            Primary = primary;
+            Secondary = secondary;
+            WidthBase = widthBase;
+        }
+    }
+
+    private List<GaugeSlot> BuildVisibleSlots()
+    {
+        // N/A (kullanılamayan) göstergeler şeritte hiç yer kaplamaz.
+        var visible = _gauges.Where(g => g.Available).ToList();
+        var slots = new List<GaugeSlot>();
+        for (int i = 0; i < visible.Count; i++)
+        {
+            var gm = visible[i];
+            int baseWidth = gm.Size switch { GaugeSize.Large => GaugeWidthLarge, GaugeSize.Small => GaugeWidthSmall, _ => GaugeWidthMedium };
+
+            // CPU çekirdek sıcaklıkları 2'li gruplar hâlinde alt alta gösterilir.
+            if (gm.Kind == GaugeKind.CpuCoreTemp && i + 1 < visible.Count && visible[i + 1].Kind == GaugeKind.CpuCoreTemp)
+            {
+                slots.Add(new GaugeSlot(gm, visible[i + 1], GaugeWidthSmall));
+                i++; // ikinci çekirdeği bu slotta tükettik
+            }
+            else
+            {
+                slots.Add(new GaugeSlot(gm, null, baseWidth));
+            }
+        }
+        return slots;
+    }
+
     private void PositionWindow()
     {
         float scale = (DeviceDpi / 96f) * (_settings.ScalePercent / 100f);
         int totalWidth = 20;
-        foreach (var gm in _gauges)
-        {
-            int w = gm.Size switch { GaugeSize.Large => GaugeWidthLarge, GaugeSize.Small => GaugeWidthSmall, _ => GaugeWidthMedium };
-            totalWidth += (int)(w * scale) + (int)(_settings.GaugeSpacing * scale);
-        }
+        foreach (var slot in BuildVisibleSlots())
+            totalWidth += (int)(slot.WidthBase * scale) + (int)(_settings.GaugeSpacing * scale);
         int height = (int)(StripHeight * scale);
 
         var screen = ResolveScreen();
@@ -1980,6 +2036,14 @@ internal sealed class GadgetForm : Form
             if (wasActive != gm.Led.Active) anyAnimating = true;
         }
 
+        string visibleSignature = string.Join(",", _gauges.Where(g => g.Available).Select(g => g.Id));
+        if (visibleSignature != _lastVisibleSignature)
+        {
+            _lastVisibleSignature = visibleSignature;
+            PositionWindow();
+            anyAnimating = true;
+        }
+
         if (!anyAnimating && !force) return;
 
         Compose(nowSeconds * 1000.0);
@@ -2012,18 +2076,26 @@ internal sealed class GadgetForm : Form
             g.Clear(Color.Transparent);
             float scale = (DeviceDpi / 96f) * (_settings.ScalePercent / 100f);
             float x = 10 * scale;
-            foreach (var gm in _gauges)
-            {
-                int baseWidth = gm.Size switch { GaugeSize.Large => GaugeWidthLarge, GaugeSize.Small => GaugeWidthSmall, _ => GaugeWidthMedium };
-                float gw = baseWidth * scale;
-                var bounds = new RectangleF(x, 2 * scale, gw, h - 4 * scale);
-                GaugePainter.DrawGauge(g, bounds, gm, _settings);
+            float top = 2 * scale;
+            float usableHeight = h - 4 * scale;
 
-                if (_settings.LedsEnabled)
+            foreach (var slot in BuildVisibleSlots())
+            {
+                float gw = slot.WidthBase * scale;
+
+                if (slot.Secondary == null)
                 {
-                    float ledSize = gw * 0.14f;
-                    var ledRect = new RectangleF(bounds.X + (bounds.Width - ledSize) / 2, bounds.Bottom - ledSize * 1.6f, ledSize, ledSize);
-                    GaugePainter.DrawLed(g, ledRect, gm, _settings, blinkPhaseMs);
+                    var bounds = new RectangleF(x, top, gw, usableHeight);
+                    GaugePainter.DrawGauge(g, bounds, slot.Primary, _settings, blinkPhaseMs);
+                }
+                else
+                {
+                    // İki çekirdek, aynı sütunda alt alta (yarım yükseklikte) çizilir.
+                    float half = usableHeight / 2f;
+                    var topBounds = new RectangleF(x, top, gw, half);
+                    var bottomBounds = new RectangleF(x, top + half, gw, half);
+                    GaugePainter.DrawGauge(g, topBounds, slot.Primary, _settings, blinkPhaseMs);
+                    GaugePainter.DrawGauge(g, bottomBounds, slot.Secondary, _settings, blinkPhaseMs);
                 }
 
                 x += gw + _settings.GaugeSpacing * scale;
