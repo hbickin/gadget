@@ -1623,6 +1623,7 @@ internal sealed class GadgetForm : Form
     private Bitmap? _backBuffer;
     private bool _layeredOk = true;
     private readonly NotifyIcon _trayIcon;
+    private readonly ContextMenuStrip _contextMenu;
     private SettingsForm? _settingsForm;
     private bool _manualHidden;
     private bool _attachedToDesktop;
@@ -1670,12 +1671,12 @@ internal sealed class GadgetForm : Form
             Visible = true,
             Text = "MyGadget"
         };
-        var menu = new ContextMenuStrip();
-        menu.Items.Add("Göster/Gizle", null, (_, _) => ToggleVisibility());
-        menu.Items.Add("Ayarlar...", null, (_, _) => OpenSettings());
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Çıkış", null, (_, _) => Application.Exit());
-        _trayIcon.ContextMenuStrip = menu;
+        _contextMenu = new ContextMenuStrip();
+        _contextMenu.Items.Add("Ayarlar...", null, (_, _) => OpenSettings());
+        _contextMenu.Items.Add("Göster/Gizle", null, (_, _) => ToggleVisibility());
+        _contextMenu.Items.Add(new ToolStripSeparator());
+        _contextMenu.Items.Add("Çıkış", null, (_, _) => Application.Exit());
+        _trayIcon.ContextMenuStrip = _contextMenu;
         _trayIcon.DoubleClick += (_, _) => OpenSettings();
     }
 
@@ -2206,7 +2207,7 @@ internal sealed class GadgetForm : Form
     protected override void OnMouseClick(MouseEventArgs e)
     {
         base.OnMouseClick(e);
-        if (e.Button == MouseButtons.Right) OpenSettings();
+        if (e.Button == MouseButtons.Right) _contextMenu.Show(Cursor.Position);
     }
 
     private void OpenSettings()
@@ -2225,6 +2226,7 @@ internal sealed class GadgetForm : Form
         _hub.StructureChanged -= OnStructureChanged;
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
+        _contextMenu.Dispose();
         _backBuffer?.Dispose();
         base.OnFormClosed(e);
     }
