@@ -1,0 +1,8 @@
+bin/
+obj/
+publish/
+*.exe
+*.pdb
+*.user
+settings.json
+log.txt
