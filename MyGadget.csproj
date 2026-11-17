@@ -17,7 +17,7 @@
   </ItemGroup>
 
   <Target Name="SignExecutable" AfterTargets="Build">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;try { $cert = Get-ChildItem cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Thumbprint -eq '081A502E0247019016BDF02E71961934BCB483C4' }; if ($cert) { Set-AuthenticodeSignature -FilePath '$(OutputPath)$(AssemblyName).exe' -Certificate $cert } } catch { } exit 0&quot;" ContinueOnError="true" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -Command &quot;try { $cert = Get-ChildItem cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Thumbprint -eq '081A502E0247019016BDF02E71961934BCB483C4' }; if ($cert) { Set-AuthenticodeSignature -FilePath '$(OutputPath)$(AssemblyName).exe' -Certificate $cert; Set-AuthenticodeSignature -FilePath '$(OutputPath)$(AssemblyName).dll' -Certificate $cert } } catch { } exit 0&quot;" ContinueOnError="true" />
   </Target>
 
 </Project>
