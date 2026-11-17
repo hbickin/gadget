@@ -198,7 +198,7 @@ internal static class NativeMethods
 
 public enum GaugeKind
 {
-    Cpu, Ram, CpuCoreTemp, CpuPackageTemp, ThreadUsage, DiskRead, NetworkDown, NetworkUp, Gpu
+    Cpu, Ram, CpuCoreTemp, CpuPackageTemp, GpuTemperature, ThreadUsage, DiskRead, NetworkDown, NetworkUp, Gpu
 }
 
 public enum GaugeSize { Large, Medium, Small }
@@ -1101,14 +1101,18 @@ internal sealed class TemperatureSensorManager : IDisposable
         if (readings != null)
         {
             EnsurePackageFallback(readings);
-            return ApplyUnit(readings);
+            readings = ApplyUnit(readings);
         }
-
-        _activeSourceDescription = "Yok (LibreHardwareMonitor'ü çalıştırın)";
-        var fallback = new Dictionary<string, SensorReading>();
-        for (int i = 0; i < coreCount; i++) fallback[$"cpu_core_{i}"] = SensorReading.Unavailable();
-        fallback["cpu_package"] = SensorReading.Unavailable();
-        return fallback;
+        else
+        {
+            _activeSourceDescription = "Yok (LibreHardwareMonitor'ü çalıştırın)";
+            readings = new Dictionary<string, SensorReading>();
+            for (int i = 0; i < coreCount; i++) readings[$"cpu_core_{i}"] = SensorReading.Unavailable();
+            readings["cpu_package"] = SensorReading.Unavailable();
+        }
+        
+        TryAddGpuTemperature(readings);
+        return readings;
     }
 
     private Dictionary<string, SensorReading>? TryLibreHardwareMonitorWmi(int coreCount)
@@ -1119,17 +1123,19 @@ internal sealed class TemperatureSensorManager : IDisposable
         {
             using var searcher = new ManagementObjectSearcher(@"root\LibreHardwareMonitor",
                 "SELECT Name, Identifier, Value FROM Sensor WHERE SensorType='Temperature'");
-            var items = searcher.Get().Cast<ManagementObject>()
-                .Where(mo => ((string?)mo["Identifier"])?.Contains("cpu", StringComparison.OrdinalIgnoreCase) == true)
-                .ToList();
+            var items = searcher.Get().Cast<ManagementObject>().ToList();
             if (items.Count == 0) return null;
 
             var result = new Dictionary<string, SensorReading>();
             foreach (var mo in items)
             {
                 string name = (string?)mo["Name"] ?? "";
+                string identifier = (string?)mo["Identifier"] ?? "";
                 float value = Convert.ToSingle(mo["Value"]);
-                ClassifyCpuSensor(name, value, result);
+                if (IsGpuTemperatureSensor(name, identifier))
+                    AddMaximumTemperature(result, "gpu_temperature", value);
+                else
+                    ClassifyCpuSensor(name, value, result);
             }
             if (result.Count == 0) return null;
             _activeSourceDescription = "LibreHardwareMonitor (WMI)";
@@ -1173,7 +1179,12 @@ internal sealed class TemperatureSensorManager : IDisposable
             if (m.Success && valueStr.Contains('°'))
             {
                 if (float.TryParse(m.Value.Replace(',', '.'), System.Globalization.CultureInfo.InvariantCulture, out var val))
-                    ClassifyCpuSensor(text, val, result);
+                {
+                    if (IsGpuTemperatureSensor(text, ""))
+                        AddMaximumTemperature(result, "gpu_temperature", val);
+                    else
+                        ClassifyCpuSensor(text, val, result);
+                }
             }
         }
         if (node.TryGetProperty("Children", out var children) && children.ValueKind == JsonValueKind.Array)
@@ -1181,6 +1192,19 @@ internal sealed class TemperatureSensorManager : IDisposable
             foreach (var child in children.EnumerateArray())
                 CollectTemperatureNodes(child, result);
         }
+    }
+
+    private static bool IsGpuTemperatureSensor(string name, string identifier) =>
+        name.Contains("GPU", StringComparison.OrdinalIgnoreCase)
+        || name.Contains("Graphics", StringComparison.OrdinalIgnoreCase)
+        || name.Contains("Memory", StringComparison.OrdinalIgnoreCase)
+        || identifier.Contains("/gpu-", StringComparison.OrdinalIgnoreCase)
+        || identifier.Contains("\\gpu-", StringComparison.OrdinalIgnoreCase);
+
+    private static void AddMaximumTemperature(Dictionary<string, SensorReading> result, string id, float celsius)
+    {
+        if (!result.TryGetValue(id, out var current) || !current.Available || celsius > current.Value)
+            result[id] = new SensorReading { Value = celsius, Available = true, DigitalText = $"{celsius:0.0}°" };
     }
 
     private Dictionary<string, SensorReading>? TryAcpi(int coreCount)
@@ -1232,6 +1256,7 @@ internal sealed class TemperatureSensorManager : IDisposable
         for (int i = 0; i < coreCount; i++)
             result.TryAdd($"cpu_core_{i}", SensorReading.Unavailable());
         result.TryAdd("cpu_package", SensorReading.Unavailable());
+        result.TryAdd("gpu_temperature", SensorReading.Unavailable());
         return result;
     }
 
@@ -1265,6 +1290,153 @@ internal sealed class TemperatureSensorManager : IDisposable
             converted[kv.Key] = new SensorReading { Value = f, Available = true, DigitalText = $"{f:0.0}°F" };
         }
         return converted;
+    }
+
+    private void TryAddGpuTemperature(Dictionary<string, SensorReading> readings)
+    {
+        if (readings.TryGetValue("gpu_temperature", out var existing) && existing.Available)
+            return;
+
+        // 1. LibreHardwareMonitor HTTP API üzerinden GPU sıcaklığı (en güvenilir)
+        double? temp = TryGetGpuTempFromLhm();
+        if (temp.HasValue)
+        {
+            readings["gpu_temperature"] = new SensorReading 
+            { 
+                Value = temp.Value, 
+                Available = true, 
+                DigitalText = _settings.UseFahrenheit 
+                    ? $"{temp.Value * 9.0 / 5.0 + 32.0:0.0}°F" 
+                    : $"{temp.Value:0.0}°" 
+            };
+            return;
+        }
+
+        // 2. WMI Thermal Zone (yaklaşık GPU sıcaklığı - admin olmadan)
+        double? thermalTemp = TryGetThermalZoneTemp();
+        if (thermalTemp.HasValue)
+        {
+            readings["gpu_temperature"] = new SensorReading 
+            { 
+                Value = thermalTemp.Value, 
+                Available = true, 
+                DigitalText = _settings.UseFahrenheit 
+                    ? $"{thermalTemp.Value * 9.0 / 5.0 + 32.0:0.0}°F" 
+                    : $"{thermalTemp.Value:0.0}°" 
+            };
+            return;
+        }
+
+        // 3. Performance Counter (GPU Engine sıcaklığı tahmini)
+        double? perfCounterTemp = TryGetGpuTempFromPerformanceCounter();
+        if (perfCounterTemp.HasValue)
+        {
+            readings["gpu_temperature"] = new SensorReading 
+            { 
+                Value = perfCounterTemp.Value, 
+                Available = true, 
+                DigitalText = _settings.UseFahrenheit 
+                    ? $"{perfCounterTemp.Value * 9.0 / 5.0 + 32.0:0.0}°F" 
+                    : $"{perfCounterTemp.Value:0.0}°" 
+            };
+            return;
+        }
+
+        readings.TryAdd("gpu_temperature", SensorReading.Unavailable());
+    }
+
+    private double? TryGetThermalZoneTemp()
+    {
+        // GPU spesifik thermal zone
+        double? temp = TryGetThermalZoneTempByName("GPU");
+        if (temp.HasValue) return temp;
+
+        // Generic thermal zone
+        temp = TryGetThermalZoneTempByName(null);
+        return temp;
+    }
+
+    private double? TryGetThermalZoneTempByName(string? filterName)
+    {
+        try
+        {
+            string query = "SELECT CurrentTemperature FROM Win32_PerfFormattedData_Counters_ThermalZoneInformation";
+            if (!string.IsNullOrEmpty(filterName))
+                query += $" WHERE Name LIKE '%{filterName}%'";
+
+            using var searcher = new ManagementObjectSearcher("root\\cimv2", query);
+            foreach (ManagementObject mo in searcher.Get())
+            {
+                if (mo["CurrentTemperature"] is ulong temp)
+                {
+                    double celsius = temp / 100.0;
+                    if (celsius > 0 && celsius < 150)
+                    {
+                        // GPU sıcaklıkları genelde 50+, CPU 40-80 arasında
+                        if (string.IsNullOrEmpty(filterName))
+                        {
+                            if (celsius >= 50) return celsius;
+                        }
+                        else
+                        {
+                            return celsius;
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Thermal Zone ({filterName ?? "generic"}) sıcaklığı alınamadı: {ex.Message}");
+        }
+        return null;
+    }
+
+    private double? TryGetGpuTempFromPerformanceCounter()
+    {
+        return null; // Performance Counter GPU sıcaklığı doğrudan sağlamıyor
+    }
+
+    private double? TryGetGpuTempFromLhm()
+    {
+        try
+        {
+            var url = $"http://localhost:{_settings.LhmHttpPort}/data.json";
+            var json = _http.GetStringAsync(url).GetAwaiter().GetResult();
+            using var doc = JsonDocument.Parse(json);
+
+            double maxTemp = -1;
+            CollectGpuTemperature(doc.RootElement, ref maxTemp);
+            
+            if (maxTemp > 0 && maxTemp < 150) return maxTemp;
+        }
+        catch { /* LibreHardwareMonitor HTTP mevcut değil */ }
+        return null;
+    }
+
+    private void CollectGpuTemperature(JsonElement node, ref double maxTemp)
+    {
+        if (node.TryGetProperty("Text", out var textEl) && node.TryGetProperty("Value", out var valueEl))
+        {
+            string text = textEl.GetString() ?? "";
+            string valueStr = valueEl.GetString() ?? "";
+            
+            if (IsGpuTemperatureSensor(text, ""))
+            {
+                var m = Regex.Match(valueStr, @"-?\d+[.,]?\d*");
+                if (m.Success && float.TryParse(m.Value.Replace(',', '.'), 
+                    System.Globalization.CultureInfo.InvariantCulture, out var val))
+                {
+                    if (val > maxTemp && val > 0 && val < 150)
+                        maxTemp = val;
+                }
+            }
+        }
+        if (node.TryGetProperty("Children", out var children) && children.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var child in children.EnumerateArray())
+                CollectGpuTemperature(child, ref maxTemp);
+        }
     }
 
     public void Dispose() => _http.Dispose();
@@ -2014,6 +2186,7 @@ internal sealed class GadgetForm : Form
         bool changed = false;
         changed |= EnsureGauge("disk_c", GaugeKind.DiskRead, 70, 90);
         changed |= EnsureGauge("cpu_package", GaugeKind.CpuPackageTemp, 70, 85);
+        changed |= EnsureGauge("gpu_temperature", GaugeKind.GpuTemperature, 70, 85);
         for (int i = 0; i < _hub.CoreCount; i++)
             changed |= EnsureGauge($"cpu_core_{i}", GaugeKind.CpuCoreTemp, 70, 85);
         foreach (var tid in _hub.ThreadIds())
@@ -2099,6 +2272,7 @@ internal sealed class GadgetForm : Form
         GaugeKind.DiskRead => "C:",
         GaugeKind.CpuPackageTemp => "Package",
         GaugeKind.CpuCoreTemp => "Core " + ExtractTrailingNumber(gs.Id),
+        GaugeKind.GpuTemperature => "GPU Temp",
         GaugeKind.NetworkDown => StripSuffix(gs.Id, NetworkSensorManager.DownSuffix) + " ↓",
         GaugeKind.NetworkUp => StripSuffix(gs.Id, NetworkSensorManager.UpSuffix) + " ↑",
         GaugeKind.Gpu => _hub.GpuDisplayName(gs.Id),
@@ -2121,6 +2295,7 @@ internal sealed class GadgetForm : Form
         GaugeKind.Ram => GaugeSize.Large,
         GaugeKind.CpuCoreTemp => GaugeSize.Small,
         GaugeKind.CpuPackageTemp => GaugeSize.Small,
+        GaugeKind.GpuTemperature => GaugeSize.Small,
         GaugeKind.ThreadUsage => GaugeSize.Small,
         _ => GaugeSize.Medium
     };
